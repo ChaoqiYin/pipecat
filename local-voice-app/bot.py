@@ -17,6 +17,7 @@ from loguru import logger
 from pydantic import ValidationError
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.evals.transport import EvalTransportParams
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
@@ -37,6 +38,7 @@ from pipecat.workers.runner import WorkerRunner
 
 transport_params = {
     "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
+    "eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=True),
 }
 
 
@@ -181,7 +183,7 @@ async def run_bot_session(
 
 async def bot(runner_args: RunnerArguments):
     """Main bot entry point compatible with Pipecat Cloud."""
-    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
     transport = await create_transport(runner_args, transport_params)
     await run_bot(transport, runner_args)
 
