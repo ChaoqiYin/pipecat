@@ -12,18 +12,25 @@ Protocol reference: https://www.volcengine.com/docs/6561/1354869.
 import asyncio
 import gzip
 import json
+import math
 import struct
 import zlib
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
-from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
-from pipecat.frames.frames import EndFrame, Frame, InterimTranscriptionFrame, TranscriptionFrame
+from pipecat.frames.frames import (
+    EndFrame,
+    ErrorFrame,
+    Frame,
+    InterimTranscriptionFrame,
+    TranscriptionFrame,
+)
 from pipecat.processors.frame_processor import FrameProcessorSetup
 from pipecat.services.settings import STTSettings
 from pipecat.services.stt_service import WebsocketSTTService
+from pipecat.services.websocket_service import ReportErrorCallback
 from pipecat.utils.time import time_now_iso8601
 
 
@@ -37,7 +44,7 @@ def _encode_request(payload: bytes, sequence: int, *, audio: bool = False) -> by
     return header + struct.pack(">iI", sequence, len(body)) + body
 
 
-def _decode_response(message: bytes | str) -> dict:
+def _decode_response(message: bytes | str) -> tuple[dict, bool]:
     """Decode a full server response or raise a descriptive protocol error."""
     if not isinstance(message, bytes):
         raise ValueError("Expected a binary response")
@@ -77,7 +84,7 @@ def _decode_response(message: bytes | str) -> dict:
         raise ValueError("Invalid JSON response") from exc
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object")
-    return data
+    return data, bool(flags & 0x2)
 
 
 class VolcengineSTTService(WebsocketSTTService):
@@ -85,6 +92,8 @@ class VolcengineSTTService(WebsocketSTTService):
 
     Credentials belong in backend configuration. Definite recognition segments
     are independent of user turn completion, which remains the VAD's concern.
+    Segment timestamps identify committed results within each connection.
+    Audio queued during an overflow or connection failure is discarded.
     """
 
     def __init__(
@@ -94,6 +103,8 @@ class VolcengineSTTService(WebsocketSTTService):
         resource_id: str = "volc.seedasr.sauc.duration",
         ws_url: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
         sample_rate: int | None = None,
+        flush_timeout: float = 2.0,
+        send_timeout: float = 1.0,
         **kwargs,
     ):
         """Initialize streaming recognition.
@@ -103,31 +114,65 @@ class VolcengineSTTService(WebsocketSTTService):
             resource_id: Enabled recognition resource identifier.
             ws_url: Recognition endpoint.
             sample_rate: PCM sample rate, or the pipeline input rate when omitted.
+            flush_timeout: Maximum seconds to drain audio and await the final response.
+            send_timeout: Maximum seconds to send a protocol packet.
             **kwargs: Additional arguments passed to WebsocketSTTService.
         """
         super().__init__(
             sample_rate=sample_rate, settings=STTSettings(model="bigmodel", language=None), **kwargs
         )
+        for name, value in (("flush_timeout", flush_timeout), ("send_timeout", send_timeout)):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        self._send_timeout = send_timeout
+        self._flush_timeout = flush_timeout
+        self._final_response = asyncio.Event()
         self._api_key = api_key
         self._resource_id = resource_id
         self._ws_url = ws_url
+        self._accepting_audio = False
         self._request_id = ""
         self._sequence = 1
+        self._committed_segments: set[tuple[str, int, int]] = set()
         self._receive_task: asyncio.Task | None = None
         self._send_task: asyncio.Task | None = None
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
 
-    async def setup(self, setup: FrameProcessorSetup):
-        """Configure the audio rate and open the recognition stream."""
-        await super().setup(setup)
-        await self._connect()
+    async def setup(self, setup: FrameProcessorSetup) -> None:
+        """Configure the audio rate and open the recognition stream.
 
-    async def stop(self, frame: EndFrame):
-        """Send the end-of-audio marker before closing the stream."""
+        Args:
+            setup: Pipeline setup parameters.
+        """
+        await super().setup(setup)
         try:
-            await self._audio_queue.join()
-            if self._websocket and self._websocket.state is State.OPEN:
-                await self._websocket.send(_encode_request(b"", -self._sequence, audio=True))
+            await self._connect()
+        except Exception as exc:
+            await self._disconnect()
+            await self._report_error(
+                ErrorFrame(f"Connection failed: {exc}", exception=exc),
+                force_treat_as_permanent=True,
+            )
+
+    async def stop(self, frame: EndFrame) -> None:
+        """Drain audio and await the final response within the flush timeout.
+
+        Args:
+            frame: The end frame.
+        """
+        self._disconnecting = True
+        await self._cancel_keepalive_task()
+        try:
+            async with asyncio.timeout(self._flush_timeout):
+                await self._audio_queue.join()
+                if self._websocket and self._websocket.state is State.OPEN:
+                    await self._send_packet(b"", -self._sequence, audio=True)
+                    await self._final_response.wait()
+        except TimeoutError as exc:
+            await self.push_error(
+                f"Volcengine STT request {self._request_id}: final response timed out",
+                exception=exc,
+            )
         except Exception as exc:
             await self.push_error(
                 f"Volcengine STT request {self._request_id}: {exc}",
@@ -138,60 +183,80 @@ class VolcengineSTTService(WebsocketSTTService):
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame | None, None]:
         """Submit audio to the stream; recognition arrives in the receive task."""
-        if self._websocket and self._websocket.state is State.OPEN:
+        if (
+            self._accepting_audio
+            and not self._disconnecting
+            and self._websocket
+            and self._websocket.state is State.OPEN
+        ):
             packet_size = max(2, self.sample_rate // 10 * 2)
             for offset in range(0, len(audio), packet_size):
                 try:
                     self._audio_queue.put_nowait(audio[offset : offset + packet_size])
                 except asyncio.QueueFull:
+                    self._discard_queued_audio()
                     await self.push_error(
                         f"Volcengine STT request {self._request_id}: audio queue full; audio dropped"
                     )
                     break
         yield None
 
-    async def _send_audio(self):
+    def _discard_queued_audio(self) -> None:
+        while not self._audio_queue.empty():
+            self._audio_queue.get_nowait()
+            self._audio_queue.task_done()
+
+    async def _send_packet(self, payload: bytes, sequence: int, *, audio: bool = False) -> None:
+        if self._websocket is None:
+            raise ConnectionError("Recognition stream is not connected")
+        try:
+            async with asyncio.timeout(self._send_timeout):
+                await self._websocket.send(_encode_request(payload, sequence, audio=audio))
+        except TimeoutError as exc:
+            raise TimeoutError("Protocol packet send timed out") from exc
+
+    async def _send_audio(self) -> None:
         while True:
             audio = await self._audio_queue.get()
             try:
                 if self._websocket and self._websocket.state is State.OPEN:
-                    await self._websocket.send(_encode_request(audio, self._sequence, audio=True))
+                    await self._send_packet(audio, self._sequence, audio=True)
                     self._sequence += 1
             except Exception as exc:
+                self._accepting_audio = False
                 await self.push_error(
                     f"Volcengine STT request {self._request_id}: {exc}",
                     exception=exc,
                 )
+                if self._websocket:
+                    await self._websocket.close()
+                return
             finally:
                 self._audio_queue.task_done()
 
-    async def _send_keepalive(self, silence: bytes):
+    async def _send_keepalive(self, silence: bytes) -> None:
         async for _ in self.run_stt(silence):
             pass
         self._record_stt_audio_usage(silence)
 
-    async def _connect(self):
+    async def _connect(self) -> None:
         await super()._connect()
         await self._connect_websocket()
-        self._send_task = self.create_task(self._send_audio())
-        self._receive_task = self.create_task(self._receive_messages())
+        self._receive_task = self.create_task(self._receive_task_handler(self._report_error))
 
-    async def _disconnect(self):
+    async def _disconnect(self) -> None:
         await super()._disconnect()
-        if self._send_task:
-            await self.cancel_task(self._send_task)
-            self._send_task = None
-        while not self._audio_queue.empty():
-            self._audio_queue.get_nowait()
-            self._audio_queue.task_done()
         if self._receive_task:
             await self.cancel_task(self._receive_task)
             self._receive_task = None
         await self._disconnect_websocket()
 
-    async def _connect_websocket(self):
+    async def _connect_websocket(self) -> None:
+        self._accepting_audio = False
         self._request_id = str(uuid4())
         self._sequence = 1
+        self._committed_segments.clear()
+        self._final_response.clear()
         self._websocket = await self._websocket_connect(
             self._ws_url,
             additional_headers={
@@ -217,51 +282,82 @@ class VolcengineSTTService(WebsocketSTTService):
             },
         }
         assert self._websocket is not None
-        await self._websocket.send(_encode_request(json.dumps(request).encode(), self._sequence))
+        try:
+            await self._send_packet(json.dumps(request).encode(), self._sequence)
+        except BaseException:
+            await self._disconnect_websocket()
+            raise
         self._sequence += 1
+        self._accepting_audio = True
+        self._send_task = self.create_task(self._send_audio())
         await self._call_event_handler("on_connected")
 
-    async def _disconnect_websocket(self):
+    async def _disconnect_websocket(self) -> None:
+        self._accepting_audio = False
+        if self._send_task:
+            await self.cancel_task(self._send_task)
+            self._send_task = None
+        self._discard_queued_audio()
         if self._websocket:
             await self._websocket.close()
             self._websocket = None
             await self._call_event_handler("on_disconnected")
 
-    async def _receive_messages(self):
-        try:
-            if self._websocket:
-                async for message in self._websocket:
-                    try:
-                        data = _decode_response(message)
-                        result = data.get("result", {})
-                        utterances = result.get("utterances", [])
-                        if not utterances:
-                            utterances = [{"text": result.get("text", ""), "definite": False}]
-                        for utterance in utterances:
-                            text = utterance.get("text", "")
-                            if not text:
+    async def _report_error(
+        self, error: ErrorFrame, force_treat_as_permanent: bool = False
+    ) -> None:
+        error.error = f"Volcengine STT request {self._request_id}: {error.error}"
+        await super()._report_error(error, force_treat_as_permanent)
+
+    async def _maybe_try_reconnect(
+        self,
+        error_message: str,
+        report_error: ReportErrorCallback,
+        error: Exception | None = None,
+    ) -> bool:
+        if not self._disconnecting and self._reconnect_on_error:
+            await report_error(ErrorFrame(error_message, exception=error))
+        return await super()._maybe_try_reconnect(error_message, report_error, error)
+
+    async def _receive_messages(self) -> None:
+        if self._websocket:
+            async for message in self._websocket:
+                try:
+                    data, is_final = _decode_response(message)
+                    result = data.get("result", {})
+                    utterances = result.get("utterances", [])
+                    if not utterances:
+                        utterances = [{"text": result.get("text", ""), "definite": False}]
+                    for utterance in utterances:
+                        text = utterance.get("text", "")
+                        if not text:
+                            continue
+                        if utterance.get("definite"):
+                            start = utterance.get("start_time")
+                            end = utterance.get("end_time")
+                            if not isinstance(start, int) or not isinstance(end, int):
+                                raise ValueError("Definite segment is missing integer timestamps")
+                            segment = (self._request_id, start, end)
+                            if segment in self._committed_segments:
                                 continue
-                            frame_type = (
-                                TranscriptionFrame
-                                if utterance.get("definite")
-                                else InterimTranscriptionFrame
-                            )
-                            await self.push_frame(
-                                frame_type(
-                                    text,
-                                    self._user_id,
-                                    time_now_iso8601(),
-                                    result=data,
-                                )
-                            )
-                    except (ValueError, TypeError, AttributeError) as exc:
-                        await self.push_error(
-                            f"Volcengine STT request {self._request_id}: {exc}",
-                            exception=exc,
+                            self._committed_segments.add(segment)
+                        frame_type = (
+                            TranscriptionFrame
+                            if utterance.get("definite")
+                            else InterimTranscriptionFrame
                         )
-        except ConnectionClosed as exc:
-            if not self._disconnecting:
-                await self.push_error(
-                    f"Volcengine STT request {self._request_id}: {exc}",
-                    exception=exc,
-                )
+                        await self.push_frame(
+                            frame_type(
+                                text,
+                                self._user_id,
+                                time_now_iso8601(),
+                                result=data,
+                            )
+                        )
+                    if is_final:
+                        self._final_response.set()
+                except (ValueError, TypeError, AttributeError) as exc:
+                    await self.push_error(
+                        f"Volcengine STT request {self._request_id}: {exc}",
+                        exception=exc,
+                    )
