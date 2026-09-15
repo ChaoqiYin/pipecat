@@ -13,9 +13,11 @@ import asyncio
 import gzip
 import json
 import struct
+import zlib
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
+from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
 from pipecat.frames.frames import EndFrame, Frame, InterimTranscriptionFrame, TranscriptionFrame
@@ -62,7 +64,7 @@ def _decode_response(message: bytes | str) -> dict:
     if compression == 1:
         try:
             payload = gzip.decompress(payload)
-        except (OSError, EOFError) as exc:
+        except (OSError, EOFError, zlib.error) as exc:
             raise ValueError("Invalid gzip response") from exc
     if message_type == 0xF:
         code = struct.unpack_from(">I", message, header_size)[0]
@@ -226,33 +228,40 @@ class VolcengineSTTService(WebsocketSTTService):
             await self._call_event_handler("on_disconnected")
 
     async def _receive_messages(self):
-        if self._websocket:
-            async for message in self._websocket:
-                try:
-                    data = _decode_response(message)
-                    result = data.get("result", {})
-                    utterances = result.get("utterances", [])
-                    if not utterances:
-                        utterances = [{"text": result.get("text", ""), "definite": False}]
-                    for utterance in utterances:
-                        text = utterance.get("text", "")
-                        if not text:
-                            continue
-                        frame_type = (
-                            TranscriptionFrame
-                            if utterance.get("definite")
-                            else InterimTranscriptionFrame
-                        )
-                        await self.push_frame(
-                            frame_type(
-                                text,
-                                self._user_id,
-                                time_now_iso8601(),
-                                result=data,
+        try:
+            if self._websocket:
+                async for message in self._websocket:
+                    try:
+                        data = _decode_response(message)
+                        result = data.get("result", {})
+                        utterances = result.get("utterances", [])
+                        if not utterances:
+                            utterances = [{"text": result.get("text", ""), "definite": False}]
+                        for utterance in utterances:
+                            text = utterance.get("text", "")
+                            if not text:
+                                continue
+                            frame_type = (
+                                TranscriptionFrame
+                                if utterance.get("definite")
+                                else InterimTranscriptionFrame
                             )
+                            await self.push_frame(
+                                frame_type(
+                                    text,
+                                    self._user_id,
+                                    time_now_iso8601(),
+                                    result=data,
+                                )
+                            )
+                    except (ValueError, TypeError, AttributeError) as exc:
+                        await self.push_error(
+                            f"Volcengine STT request {self._request_id}: {exc}",
+                            exception=exc,
                         )
-                except (ValueError, TypeError, AttributeError) as exc:
-                    await self.push_error(
-                        f"Volcengine STT request {self._request_id}: {exc}",
-                        exception=exc,
-                    )
+        except ConnectionClosed as exc:
+            if not self._disconnecting:
+                await self.push_error(
+                    f"Volcengine STT request {self._request_id}: {exc}",
+                    exception=exc,
+                )

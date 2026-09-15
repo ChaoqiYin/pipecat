@@ -16,6 +16,7 @@ import pytest
 from websockets.asyncio.server import serve
 
 from pipecat.frames.frames import (
+    EndFrame,
     ErrorFrame,
     InputAudioRawFrame,
     InterimTranscriptionFrame,
@@ -23,8 +24,11 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
 )
 from pipecat.observers.base_observer import BaseObserver
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.pipeline.worker import PipelineWorker
 from pipecat.services.volcengine.stt import VolcengineSTTService
 from pipecat.tests.utils import run_test
+from pipecat.workers.runner import WorkerRunner
 
 
 def _response(payload, *, sequence=1, compressed=True):
@@ -41,14 +45,33 @@ class _ResultObserver(BaseObserver):
         self.service = service
         self.count = count
         self.received = asyncio.Event()
+        self.frames = []
 
     async def on_push_frame(self, data):
         if data.source is self.service and isinstance(
             data.frame, (InterimTranscriptionFrame, TranscriptionFrame, ErrorFrame)
         ):
+            self.frames.append(data.frame)
             self.count -= 1
             if self.count == 0:
                 self.received.set()
+
+
+async def _run_until_results(service, count):
+    observer = _ResultObserver(service, count)
+    worker = PipelineWorker(Pipeline([service]), enable_rtvi=False, observers=[observer])
+    runner = WorkerRunner()
+    await runner.add_workers(worker)
+    await worker.queue_frame(InputAudioRawFrame(b"\0\0" * 160, 16000, 1))
+
+    async def finish():
+        try:
+            await asyncio.wait_for(observer.received.wait(), 5)
+        finally:
+            await worker.queue_frame(EndFrame())
+
+    await asyncio.gather(runner.run(), finish())
+    return observer.frames
 
 
 @pytest.mark.asyncio
@@ -82,45 +105,8 @@ async def test_partial_and_definite_results_become_standard_frames(compressed):
             ws_url=f"ws://127.0.0.1:{port}",
             audio_passthrough=False,
         )
-        observer = _ResultObserver(service, 2)
+        transcripts = await _run_until_results(service, 2)
 
-        @service.event_handler("on_connected")
-        async def connected(service):
-            pass
-
-        # End only after the receive task has emitted both results.
-        from pipecat.frames.frames import EndFrame
-        from pipecat.pipeline.pipeline import Pipeline
-        from pipecat.pipeline.worker import PipelineWorker
-        from pipecat.workers.runner import WorkerRunner
-
-        received = []
-
-        class Collector(BaseObserver):
-            async def on_push_frame(self, data):
-                if data.source is service:
-                    received.append(data.frame)
-
-        worker = PipelineWorker(
-            Pipeline([service]),
-            enable_rtvi=False,
-            observers=[observer, Collector()],
-        )
-        runner = WorkerRunner()
-        await runner.add_workers(worker)
-        await worker.queue_frame(InputAudioRawFrame(b"\0\0" * 160, 16000, 1))
-
-        async def finish():
-            try:
-                await asyncio.wait_for(observer.received.wait(), 3)
-            finally:
-                await worker.queue_frame(EndFrame())
-
-        await asyncio.gather(runner.run(), finish())
-
-    transcripts = [
-        f for f in received if isinstance(f, (InterimTranscriptionFrame, TranscriptionFrame))
-    ]
     assert [(type(f), f.text) for f in transcripts] == [
         (InterimTranscriptionFrame, "Hello"),
         (TranscriptionFrame, "Hello there."),
@@ -201,50 +187,33 @@ async def test_stream_authenticates_and_sends_sequenced_pcm_with_end_marker():
         (b"\x11\x91", "truncated"),
         (b"\x11\x90\x10\x00\x00\x00\x00\x08{}", "payload size"),
         (b"\x11\x90\x11\x00\x00\x00\x00\x02{}", "gzip"),
+        (
+            b"\x11\x90\x11\x00\x00\x00\x00\x13"
+            + bytes.fromhex("1f8b0800000000000003070000000000000000"),
+            "gzip",
+        ),
         (b"\x11\x90\x10\x00\x00\x00\x00\x01{", "JSON"),
         ("unexpected text", "binary"),
+        (None, "1011"),
     ],
 )
 async def test_protocol_failures_emit_nonfatal_error_with_request_id(message, expected):
-    from pipecat.frames.frames import EndFrame
-    from pipecat.pipeline.pipeline import Pipeline
-    from pipecat.pipeline.worker import PipelineWorker
-    from pipecat.workers.runner import WorkerRunner
-
     request_ids = []
-    errors = []
 
     async def handler(websocket):
         request_ids.append(websocket.request.headers["X-Api-Request-Id"])
         await websocket.recv()
         await websocket.recv()
-        await websocket.send(message)
+        if message is None:
+            await websocket.close(code=1011, reason="test failure")
+        else:
+            await websocket.send(message)
         await websocket.wait_closed()
 
     async with serve(handler, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
         service = VolcengineSTTService(api_key="test-key", ws_url=f"ws://127.0.0.1:{port}")
-        observer = _ResultObserver(service, 1)
-
-        class Collector(BaseObserver):
-            async def on_push_frame(self, data):
-                if data.source is service and isinstance(data.frame, ErrorFrame):
-                    errors.append(data.frame)
-
-        worker = PipelineWorker(
-            Pipeline([service]), enable_rtvi=False, observers=[observer, Collector()]
-        )
-        runner = WorkerRunner()
-        await runner.add_workers(worker)
-        await worker.queue_frame(InputAudioRawFrame(b"\0\0" * 160, 16000, 1))
-
-        async def finish():
-            try:
-                await asyncio.wait_for(observer.received.wait(), 5)
-            finally:
-                await worker.queue_frame(EndFrame())
-
-        await asyncio.gather(runner.run(), finish())
+        errors = await _run_until_results(service, 1)
 
     assert len(errors) == 1
     assert expected in errors[0].error
