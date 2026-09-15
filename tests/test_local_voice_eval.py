@@ -363,3 +363,14 @@ async def test_missing_bot_speech_fails_instead_of_claiming_interruption():
     assert result["checks"]["required_events_within_timeout"] is False
     assert result["checks"]["eval_cancel_closed_connection"] is True
     assert result["turns"] == []
+
+
+@pytest.mark.parametrize("timeout", ["nan", "inf", "0", "-1"])
+def test_cli_rejects_unbounded_timeouts(timeout, monkeypatch, capsys):
+    import sys
+
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--timeout", timeout])
+    with pytest.raises(SystemExit) as error:
+        runpy.run_path(str(SCRIPT))["main"]()
+    assert error.value.code == 2
+    assert "finite and positive" in capsys.readouterr().err

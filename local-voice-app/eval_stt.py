@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import socket
 import sys
@@ -371,8 +372,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=ROOT / ".local/stt-eval/report.json")
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     args = parser.parse_args()
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be finite and positive")
     args.audio = args.audio.resolve()
     config = {
         key: value for key, value in dotenv_values(args.env_file).items() if value is not None
