@@ -18,6 +18,7 @@ import zlib
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
+from pydantic import BaseModel, ConfigDict, JsonValue
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -96,6 +97,22 @@ class VolcengineSTTService(WebsocketSTTService):
     Audio queued during an overflow or connection failure is discarded.
     """
 
+    class InputParams(BaseModel):
+        """Recognition options fixed for the lifetime of a session.
+
+        Parameters:
+            enable_itn: Inverse text normalization, or the provider default when omitted.
+            enable_punc: Punctuation, or the provider default when omitted.
+            corpus_context: Provider corpus context object, including supported hotword hints.
+                Encoded as a JSON string in ``request.corpus.context``.
+        """
+
+        model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+        enable_itn: bool | None = None
+        enable_punc: bool | None = None
+        corpus_context: dict[str, JsonValue] | None = None
+
     def __init__(
         self,
         *,
@@ -105,6 +122,7 @@ class VolcengineSTTService(WebsocketSTTService):
         sample_rate: int | None = None,
         flush_timeout: float = 2.0,
         send_timeout: float = 1.0,
+        params: InputParams | None = None,
         **kwargs,
     ):
         """Initialize streaming recognition.
@@ -116,6 +134,7 @@ class VolcengineSTTService(WebsocketSTTService):
             sample_rate: PCM sample rate, or the pipeline input rate when omitted.
             flush_timeout: Maximum seconds to drain audio and await the final response.
             send_timeout: Maximum seconds to send a protocol packet.
+            params: Recognition options. Second-pass recognition is always disabled.
             **kwargs: Additional arguments passed to WebsocketSTTService.
         """
         super().__init__(
@@ -125,6 +144,7 @@ class VolcengineSTTService(WebsocketSTTService):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
         self._send_timeout = send_timeout
+        self._params = (params or self.InputParams()).model_copy(deep=True)
         self._flush_timeout = flush_timeout
         self._final_response = asyncio.Event()
         self._api_key = api_key
@@ -281,6 +301,13 @@ class VolcengineSTTService(WebsocketSTTService):
                 "enable_nonstream": False,
             },
         }
+        request["request"].update(
+            self._params.model_dump(exclude_none=True, exclude={"corpus_context"})
+        )
+        if self._params.corpus_context is not None:
+            request["request"]["corpus"] = {
+                "context": json.dumps(self._params.corpus_context, ensure_ascii=False)
+            }
         assert self._websocket is not None
         try:
             await self._send_packet(json.dumps(request).encode(), self._sequence)

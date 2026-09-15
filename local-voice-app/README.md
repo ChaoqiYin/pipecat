@@ -2,7 +2,7 @@
 
 使用 Pipecat 自带的 Playground 网页，通过 WebRTC 与机器人对话：
 
-- 语音识别：ElevenLabs Realtime STT
+- 语音识别：ElevenLabs Realtime STT（默认）或火山引擎双向流式识别
 - 语言模型：DeepSeek
 - 语音合成：ElevenLabs HTTP TTS，模型为 `eleven_multilingual_v2`
 
@@ -31,6 +31,38 @@ ELEVENLABS_VOICE_ID=your_api_accessible_voice_id
 ```
 
 音色必须允许当前账户通过 API 使用。HTTP 会话支持系统代理环境变量。
+
+`STT_PROVIDER` 只接受 `elevenlabs` 和 `volcengine`，未设置时使用 `elevenlabs`。
+切换到火山引擎时，在根目录 `.env` 中增加：
+
+```dotenv
+STT_PROVIDER=volcengine
+VOLCENGINE_API_KEY=your_volcengine_api_key
+VOLCENGINE_RESOURCE_ID=volc.seedasr.sauc.duration
+VOLCENGINE_STT_OPTIONS='{"enable_itn":true,"enable_punc":true}'
+```
+
+资源 ID 必须是账户已开通的识别资源；省略时使用上述默认值。`VOLCENGINE_STT_OPTIONS`
+为可选 JSON 对象，支持 `enable_itn`（逆文本规范化）、`enable_punc`（标点）和
+`corpus_context`（供应商定义的语料上下文对象）。省略标点或规范化开关时使用供应商默认行为。
+`corpus_context` 序列化为 `request.corpus.context` 的 JSON 字符串，例如热词提示：
+
+```dotenv
+VOLCENGINE_STT_OPTIONS='{"corpus_context":{"hotwords":[{"word":"Pipecat"}]}}'
+```
+
+语料上下文内部格式和热词支持以所选资源的[火山引擎接口文档](https://www.volcengine.com/docs/6561/1354869)
+为准；应用校验 JSON 对象并传递上下文，不解释内部供应商字段。
+第二遍识别固定关闭，`enable_nonstream` 等未支持的选项会被拒绝。
+
+选项和供应商在新会话装配时读取，不支持通话中切换。凭据、资源 ID 和识别选项只在后端使用，
+浏览器沿用现有音频、字幕和指标通道。所选供应商缺少凭据、供应商名称无效或选项不合法时，
+会话创建会返回明确错误，错误不包含配置值。
+即使使用火山引擎识别，语音合成仍需 `ELEVENLABS_API_KEY` 和 `ELEVENLABS_VOICE_ID`。
+
+示例配置见根目录 `env.example` 和 `local-voice-app/bot/.env.example`。
+`local-voice-app/bot/bot.py` 是共享入口的兼容转发，也读取根目录 `.env`。
+
 
 ## 新环境准备
 

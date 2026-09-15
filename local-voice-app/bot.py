@@ -8,11 +8,13 @@
 """Browser voice application using DeepSeek and ElevenLabs."""
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
+from pydantic import ValidationError
 
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
@@ -28,15 +30,55 @@ from pipecat.runner.utils import create_transport
 from pipecat.services.deepseek.llm import DeepSeekLLMService
 from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsHttpTTSService
+from pipecat.services.stt_service import STTService
+from pipecat.services.volcengine.stt import VolcengineSTTService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.workers.runner import WorkerRunner
-
-load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
-
 
 transport_params = {
     "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
 }
+
+
+def _required_setting(config: Mapping[str, str], name: str) -> str:
+    value = config.get(name, "").strip()
+    if not value:
+        raise ValueError(f"{name} is required in backend configuration")
+    return value
+
+
+def create_stt_service(environ: Mapping[str, str] | None = None) -> STTService:
+    """Create the session's recognition service from backend configuration.
+
+    Args:
+        environ: Environment variables, defaulting to the process environment.
+
+    Returns:
+        The configured recognition service.
+
+    Raises:
+        ValueError: A provider, credential, or recognition option is invalid.
+    """
+    config = os.environ if environ is None else environ
+    provider = config.get("STT_PROVIDER", "elevenlabs")
+    if provider == "elevenlabs":
+        return ElevenLabsRealtimeSTTService(api_key=_required_setting(config, "ELEVENLABS_API_KEY"))
+    if provider != "volcengine":
+        raise ValueError("STT_PROVIDER must be elevenlabs or volcengine")
+    api_key = _required_setting(config, "VOLCENGINE_API_KEY")
+    resource_id = config.get("VOLCENGINE_RESOURCE_ID", "volc.seedasr.sauc.duration").strip()
+    if not resource_id:
+        raise ValueError("VOLCENGINE_RESOURCE_ID must not be blank")
+    try:
+        params = VolcengineSTTService.InputParams.model_validate_json(
+            config.get("VOLCENGINE_STT_OPTIONS", "{}")
+        )
+    except ValidationError:
+        raise ValueError(
+            "VOLCENGINE_STT_OPTIONS must be a JSON object with supported recognition options; "
+            "second-pass recognition is not supported"
+        ) from None
+    return VolcengineSTTService(api_key=api_key, resource_id=resource_id, params=params)
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
@@ -45,17 +87,24 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         await run_bot_session(transport, runner_args, session)
 
 
-async def run_bot_session(
-    transport: BaseTransport, runner_args: RunnerArguments, session: aiohttp.ClientSession
-):
-    """Build and run the DeepSeek and ElevenLabs voice pipeline."""
-    logger.info("Starting bot")
+def create_voice_pipeline(
+    transport: BaseTransport, session: aiohttp.ClientSession
+) -> tuple[Pipeline, LLMContext]:
+    """Assemble the voice pipeline using backend recognition configuration.
 
-    stt = ElevenLabsRealtimeSTTService(api_key=os.environ["ELEVENLABS_API_KEY"])
+    Args:
+        transport: Session audio transport.
+        session: HTTP session used for speech synthesis.
+
+    Returns:
+        The pipeline and its conversation context.
+    """
+    stt = create_stt_service()
+    tts_api_key = _required_setting(os.environ, "ELEVENLABS_API_KEY")
 
     tts = ElevenLabsHttpTTSService(
         aiohttp_session=session,
-        api_key=os.getenv("ELEVENLABS_API_KEY", ""),
+        api_key=tts_api_key,
         settings=ElevenLabsHttpTTSService.Settings(
             voice=os.getenv("ELEVENLABS_VOICE_ID", ""),
             model="eleven_multilingual_v2",
@@ -86,6 +135,16 @@ async def run_bot_session(
             assistant_aggregator,  # Assistant spoken responses
         ]
     )
+
+    return pipeline, context
+
+
+async def run_bot_session(
+    transport: BaseTransport, runner_args: RunnerArguments, session: aiohttp.ClientSession
+):
+    """Build and run the voice pipeline with session-scoped recognition."""
+    logger.info("Starting bot")
+    pipeline, context = create_voice_pipeline(transport, session)
 
     worker = PipelineWorker(
         pipeline,
@@ -122,6 +181,7 @@ async def run_bot_session(
 
 async def bot(runner_args: RunnerArguments):
     """Main bot entry point compatible with Pipecat Cloud."""
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
     transport = await create_transport(runner_args, transport_params)
     await run_bot(transport, runner_args)
 
