@@ -1,0 +1,22 @@
+@import '@pipecat-ai/voice-ui-kit/styles';
+
+.voice-workspace {
+  grid-template-columns: minmax(0, 1fr) 18rem;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.voice-workspace > * {
+  min-width: 0;
+  min-height: 0;
+}
+
+.user-audio-panel {
+  flex-shrink: 0;
+}
+
+.user-audio-visualization {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 7rem;
+}
