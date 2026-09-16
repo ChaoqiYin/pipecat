@@ -5,8 +5,9 @@
 #
 
 
-"""Browser voice application using DeepSeek and ElevenLabs."""
+"""Browser voice application using DeepSeek, ElevenLabs, and Volcengine."""
 
+import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -32,7 +33,9 @@ from pipecat.services.deepseek.llm import DeepSeekLLMService
 from pipecat.services.elevenlabs.stt import ElevenLabsRealtimeSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsHttpTTSService
 from pipecat.services.stt_service import STTService
+from pipecat.services.tts_service import TTSService
 from pipecat.services.volcengine.stt import VolcengineSTTService
+from pipecat.services.volcengine.tts import VolcengineTTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.workers.runner import WorkerRunner
 
@@ -40,6 +43,21 @@ transport_params = {
     "webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True),
     "eval": lambda: EvalTransportParams(audio_in_enabled=True, audio_out_enabled=True),
 }
+
+VOLCENGINE_STT_SETTINGS = (
+    "VOLCENGINE_API_KEY",
+    "VOLCENGINE_RESOURCE_ID",
+    "VOLCENGINE_STT_OPTIONS",
+)
+
+VOLCENGINE_TTS_SETTINGS = (
+    "VOLCENGINE_TTS_API_KEY",
+    "VOLCENGINE_TTS_RESOURCE_ID",
+    "VOLCENGINE_TTS_SPEAKER",
+    "VOLCENGINE_TTS_OPTIONS",
+)
+
+ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
 
 
 def _required_setting(config: Mapping[str, str], name: str) -> str:
@@ -59,18 +77,13 @@ def create_stt_service(environ: Mapping[str, str] | None = None) -> STTService:
         The configured recognition service.
 
     Raises:
-        ValueError: A provider, credential, or recognition option is invalid.
+        ValueError: A recognition option is invalid.
     """
     config = os.environ if environ is None else environ
-    provider = config.get("STT_PROVIDER", "elevenlabs")
-    if provider == "elevenlabs":
+    if not any(name in config for name in VOLCENGINE_STT_SETTINGS):
         return ElevenLabsRealtimeSTTService(api_key=_required_setting(config, "ELEVENLABS_API_KEY"))
-    if provider != "volcengine":
-        raise ValueError("STT_PROVIDER must be elevenlabs or volcengine")
     api_key = _required_setting(config, "VOLCENGINE_API_KEY")
-    resource_id = config.get("VOLCENGINE_RESOURCE_ID", "volc.seedasr.sauc.duration").strip()
-    if not resource_id:
-        raise ValueError("VOLCENGINE_RESOURCE_ID must not be blank")
+    resource_id = _required_setting(config, "VOLCENGINE_RESOURCE_ID")
     try:
         params = VolcengineSTTService.InputParams.model_validate_json(
             config.get("VOLCENGINE_STT_OPTIONS", "{}")
@@ -83,6 +96,49 @@ def create_stt_service(environ: Mapping[str, str] | None = None) -> STTService:
     return VolcengineSTTService(api_key=api_key, resource_id=resource_id, params=params)
 
 
+def create_tts_service(
+    session: aiohttp.ClientSession, environ: Mapping[str, str] | None = None
+) -> TTSService:
+    """Create the session's synthesis service from backend configuration.
+
+    Args:
+        session: HTTP session used by the HTTP synthesis provider.
+        environ: Environment variables, defaulting to the process environment.
+
+    Returns:
+        The configured synthesis service.
+
+    Raises:
+        ValueError: A synthesis setting is missing or an option is invalid.
+    """
+    config = os.environ if environ is None else environ
+    if not any(name in config for name in VOLCENGINE_TTS_SETTINGS):
+        return ElevenLabsHttpTTSService(
+            aiohttp_session=session,
+            api_key=_required_setting(config, "ELEVENLABS_API_KEY"),
+            settings=ElevenLabsHttpTTSService.Settings(
+                voice=config.get("ELEVENLABS_VOICE_ID", ""),
+                model=ELEVENLABS_TTS_MODEL,
+            ),
+        )
+    api_key = _required_setting(config, "VOLCENGINE_TTS_API_KEY")
+    resource_id = _required_setting(config, "VOLCENGINE_TTS_RESOURCE_ID")
+    speaker = _required_setting(config, "VOLCENGINE_TTS_SPEAKER")
+    options = config.get("VOLCENGINE_TTS_OPTIONS", "{}")
+    try:
+        # The voice is configured on its own, so it is supplied here and excluded
+        # from the options object.
+        params = VolcengineTTSService.InputParams.model_validate_json(
+            json.dumps({"speaker": speaker, **json.loads(options)})
+        )
+    except (ValidationError, json.JSONDecodeError, TypeError):
+        raise ValueError(
+            "VOLCENGINE_TTS_OPTIONS must be a JSON object with supported synthesis options "
+            "and must not set the voice"
+        ) from None
+    return VolcengineTTSService(api_key=api_key, resource_id=resource_id, params=params)
+
+
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     """Run the voice pipeline with a managed HTTP session."""
     async with aiohttp.ClientSession(trust_env=True) as session:
@@ -92,26 +148,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 def create_voice_pipeline(
     transport: BaseTransport, session: aiohttp.ClientSession
 ) -> tuple[Pipeline, LLMContext]:
-    """Assemble the voice pipeline using backend recognition configuration.
+    """Assemble the voice pipeline using backend recognition and synthesis configuration.
 
     Args:
         transport: Session audio transport.
-        session: HTTP session used for speech synthesis.
+        session: HTTP session used by the HTTP synthesis provider.
 
     Returns:
         The pipeline and its conversation context.
     """
     stt = create_stt_service()
-    tts_api_key = _required_setting(os.environ, "ELEVENLABS_API_KEY")
-
-    tts = ElevenLabsHttpTTSService(
-        aiohttp_session=session,
-        api_key=tts_api_key,
-        settings=ElevenLabsHttpTTSService.Settings(
-            voice=os.getenv("ELEVENLABS_VOICE_ID", ""),
-            model="eleven_multilingual_v2",
-        ),
-    )
+    tts = create_tts_service(session)
 
     llm = DeepSeekLLMService(
         api_key=os.environ["DEEPSEEK_API_KEY"],
@@ -143,8 +190,14 @@ def create_voice_pipeline(
 
 async def run_bot_session(
     transport: BaseTransport, runner_args: RunnerArguments, session: aiohttp.ClientSession
-):
-    """Build and run the voice pipeline with session-scoped recognition."""
+) -> None:
+    """Build and run the voice pipeline with session-scoped recognition and synthesis.
+
+    Args:
+        transport: Session audio transport.
+        runner_args: Runner settings for the worker lifecycle.
+        session: HTTP session used by the HTTP synthesis provider.
+    """
     logger.info("Starting bot")
     pipeline, context = create_voice_pipeline(transport, session)
 

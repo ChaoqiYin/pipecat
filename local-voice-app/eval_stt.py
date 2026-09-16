@@ -24,6 +24,11 @@ from websockets.asyncio.client import connect as websocket_connect
 from websockets.exceptions import ConnectionClosed
 
 ROOT = Path(__file__).resolve().parents[1]
+VOLCENGINE_STT_SETTINGS = (
+    "VOLCENGINE_API_KEY",
+    "VOLCENGINE_RESOURCE_ID",
+    "VOLCENGINE_STT_OPTIONS",
+)
 
 
 def evaluate_turn(reference: str, events: list[dict]) -> dict:
@@ -40,6 +45,12 @@ def evaluate_turn(reference: str, events: list[dict]) -> dict:
     finals = [event for event in captions if event["data"].get("final", True)]
     interim = [event for event in captions if not event["data"].get("final", True)]
     stops = [event for event in events if event["type"] == "vad-user-stopped-speaking"]
+    speaking = [event for event in events if event["type"] == "bot-started-speaking"]
+    preceding_llm_stops = [
+        event
+        for event in events
+        if event["type"] == "bot-llm-stopped" and speaking and event["at"] <= speaking[0]["at"]
+    ]
     hypothesis = " ".join(event["data"].get("text", "") for event in finals)
     expected = "".join(
         c for c in unicodedata.normalize("NFKC", reference).casefold() if c.isalnum()
@@ -53,6 +64,13 @@ def evaluate_turn(reference: str, events: list[dict]) -> dict:
         row = next_row
     error_rate = row[-1] / len(expected) if expected and finals else None
     latency = (finals[-1]["at"] - stops[-1]["at"]) * 1000 if finals and stops else None
+    # Time from the end of the reply's LLM text to the first bot audio, the
+    # closest the wire gets to the synthesis provider's first packet. A barge-in
+    # can deliver the speech event without a matching LLM end, so an absent or
+    # out-of-order pair is reported as unmeasured rather than zero.
+    ttfb = (
+        (speaking[0]["at"] - preceding_llm_stops[-1]["at"]) * 1000 if preceding_llm_stops else None
+    )
     return {
         "status": "passed" if finals and interim else "failed",
         "reference": reference,
@@ -64,6 +82,7 @@ def evaluate_turn(reference: str, events: list[dict]) -> dict:
         "character_accuracy": max(0.0, 1 - error_rate) if error_rate is not None else None,
         "final_latency_ms": round(latency, 3) if latency is not None and latency >= 0 else None,
         "latency_status": "measured" if latency is not None and latency >= 0 else "unavailable",
+        "ttfb_ms": round(ttfb, 3) if ttfb is not None and ttfb >= 0 else None,
     }
 
 
@@ -124,6 +143,7 @@ async def replay_recording(
                     "vad-user-stopped-speaking",
                     "bot-started-speaking",
                     "bot-stopped-speaking",
+                    "bot-llm-stopped",
                     "bot-interrupted",
                     "error",
                 }:
@@ -288,7 +308,7 @@ async def run_provider(provider: str, args: argparse.Namespace, config: dict[str
     """
     required = ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID", "DEEPSEEK_API_KEY"]
     if provider == "volcengine":
-        required.append("VOLCENGINE_API_KEY")
+        required.extend(("VOLCENGINE_API_KEY", "VOLCENGINE_RESOURCE_ID"))
     missing = [key for key in required if not config.get(key, "").strip()]
     if missing:
         return {
@@ -312,7 +332,7 @@ async def run_provider(provider: str, args: argparse.Namespace, config: dict[str
         "--port",
         str(args.port),
         cwd=ROOT,
-        env={**config, "STT_PROVIDER": provider},
+        env=_provider_environment(provider, config),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
@@ -359,6 +379,15 @@ async def run_provider(provider: str, args: argparse.Namespace, config: dict[str
     return result
 
 
+def _provider_environment(provider: str, config: dict[str, str]) -> dict[str, str]:
+    """Build an isolated backend environment for one recognition provider."""
+    environment = config.copy()
+    if provider == "elevenlabs":
+        for name in VOLCENGINE_STT_SETTINGS:
+            environment.pop(name, None)
+    return environment
+
+
 def main() -> int:
     """Run selected providers and write a reproducible, credential-free JSON report."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -392,6 +421,7 @@ def main() -> int:
         "reference": args.reference,
         "accuracy_method": "NFKC, casefold, alphanumeric characters; Levenshtein CER; accuracy=max(0,1-CER)",
         "latency_method": "Last final caption arrival minus last raw VAD stop arrival, same replay; unavailable if absent or negative",
+        "ttfb_method": "First bot-started-speaking arrival minus last bot-llm-stopped arrival, same replay; null if absent or negative",
         "second_pass": "disabled; verified by deterministic provider protocol tests",
         "teardown": "eval-cancel and process exit; graceful end-of-stream is covered by service tests",
         "results": asyncio.run(run()),

@@ -14,6 +14,7 @@ bot = _app["bot"]
 run_bot = _app["run_bot"]
 run_bot_session = _app["run_bot_session"]
 create_stt_service = _app["create_stt_service"]
+create_tts_service = _app["create_tts_service"]
 create_voice_pipeline = _app["create_voice_pipeline"]
 transport_params = _app["transport_params"]
 

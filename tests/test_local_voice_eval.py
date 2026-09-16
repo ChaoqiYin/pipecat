@@ -52,8 +52,47 @@ def test_missing_or_negative_latency_is_not_reported_as_zero(events):
     result = runpy.run_path(str(SCRIPT))["evaluate_turn"]("Hello", events)
     assert result["final_latency_ms"] is None
     assert result["latency_status"] == "unavailable"
+    assert result["ttfb_ms"] is None
     if not events:
         assert result["character_accuracy"] is None
+
+
+def test_ttfb_measures_llm_end_to_bot_speech():
+    evaluate = runpy.run_path(str(SCRIPT))["evaluate_turn"]
+    result = evaluate(
+        "Hello",
+        [
+            {"type": "user-transcription", "at": 1, "data": {"text": "Hello", "final": True}},
+            {"type": "bot-llm-stopped", "at": 2.0},
+            {"type": "bot-started-speaking", "at": 2.25},
+        ],
+    )
+    assert result["ttfb_ms"] == 250
+
+
+def test_ttfb_measures_first_speech_against_the_llm_end_before_it():
+    evaluate = runpy.run_path(str(SCRIPT))["evaluate_turn"]
+    # Two replies in one replay: the first speech pairs with the LLM end it
+    # follows, not the later one, so the measurement stays on the first reply.
+    result = evaluate(
+        "Hello",
+        [
+            {"type": "bot-llm-stopped", "at": 1.0},
+            {"type": "bot-started-speaking", "at": 1.3},
+            {"type": "bot-llm-stopped", "at": 5.0},
+            {"type": "bot-started-speaking", "at": 5.4},
+        ],
+    )
+    assert result["ttfb_ms"] == 300
+    # Speech that precedes every LLM end is unmeasured, not clamped to zero.
+    earlier = evaluate(
+        "Hello",
+        [
+            {"type": "bot-started-speaking", "at": 1.0},
+            {"type": "bot-llm-stopped", "at": 2.0},
+        ],
+    )
+    assert earlier["ttfb_ms"] is None
 
 
 def test_repeated_finals_remain_visible_in_accuracy_without_text_deduplication():
@@ -77,10 +116,70 @@ def test_application_supports_eval_audio_transport():
     assert params.audio_in_enabled and params.audio_out_enabled
 
 
+def test_provider_environment_isolated_without_mutating_backend_configuration():
+    build_environment = runpy.run_path(str(SCRIPT))["_provider_environment"]
+    config = {
+        "ELEVENLABS_API_KEY": "eleven-key",
+        "VOLCENGINE_API_KEY": "volc-key",
+        "VOLCENGINE_RESOURCE_ID": "volc-resource",
+        "VOLCENGINE_STT_OPTIONS": '{"enable_punc":true}',
+    }
+
+    elevenlabs_environment = build_environment("elevenlabs", config)
+    volcengine_environment = build_environment("volcengine", config)
+
+    assert "VOLCENGINE_API_KEY" not in elevenlabs_environment
+    assert "VOLCENGINE_RESOURCE_ID" not in elevenlabs_environment
+    assert "VOLCENGINE_STT_OPTIONS" not in elevenlabs_environment
+    assert volcengine_environment == config
+    assert config["VOLCENGINE_API_KEY"] == "volc-key"
+
+
+def _audio_only_server(audio: bytes, *, final: bool = False) -> bytes:
+    """Build a Volcengine-style AudioOnlyServer frame carrying raw PCM.
+
+    A final frame carries a negative sequence field and the final flag, which the
+    service reads as the end of a synthesized sentence.
+    """
+    import struct
+
+    flags = 0x2 if final else 0x0
+    sequence = struct.pack(">i", -1) if final else b""
+    return (
+        bytes((0x11, 0xB0 | flags, 0x00, 0x00)) + sequence + struct.pack(">I", len(audio)) + audio
+    )
+
+
+def _decode_client_event(message: bytes) -> tuple[int, str, dict]:
+    """Decode a full Volcengine client event into ``(event, session_id, payload)``.
+
+    Session-scoped events carry a length-prefixed session identifier after the
+    event identifier; connection-scoped ones do not.
+    """
+    import json
+    import struct
+
+    assert message[:4] == b"\x11\x14\x10\x00"
+    offset = 4
+    event = struct.unpack_from(">i", message, offset)[0]
+    offset += 4
+    session_id = ""
+    if event not in (1, 2):
+        length = struct.unpack_from(">I", message, offset)[0]
+        offset += 4
+        session_id = message[offset : offset + length].decode()
+        offset += length
+    size = struct.unpack_from(">I", message, offset)[0]
+    offset += 4
+    assert len(message) == offset + size
+    return event, session_id, json.loads(message[offset:])
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["elevenlabs", "volcengine"])
+@pytest.mark.parametrize("tts_provider", ["elevenlabs", "volcengine"])
 async def test_shared_recording_captions_barge_in_and_cancel_over_real_eval_transport(
-    provider, monkeypatch, aiohttp_server, unused_tcp_port
+    provider, tts_provider, monkeypatch, aiohttp_server, unused_tcp_port
 ):
     import asyncio
     import base64
@@ -103,6 +202,27 @@ async def test_shared_recording_captions_barge_in_and_cancel_over_real_eval_tran
     commits = []
     options = []
     peer_closed = asyncio.Event()
+    tts_requests = []
+    tts_events = []
+    tts_connected = asyncio.Event()
+
+    async def tts_peer(websocket):
+        # The service writes its protocol as a stream of sends, one frame at a
+        # time: StartConnection, StartSession, then TaskRequest per sentence, and
+        # FinishSession at the end of a turn. Each request is answered with final
+        # audio so the bot actually speaks; the events are recorded so the test can
+        # assert the session lifecycle the pipeline drove.
+        try:
+            await websocket.recv()  # StartConnection
+            tts_connected.set()
+            while True:
+                event, _, payload = _decode_client_event(await websocket.recv())
+                tts_events.append(event)
+                if event == 200:
+                    tts_requests.append(payload["req_params"]["text"])
+                    await websocket.send(_audio_only_server(b"\x01\x00" * 4800, final=True))
+        finally:
+            tts_connected.set()
 
     async def recognition_peer(websocket):
         active = False
@@ -237,15 +357,25 @@ async def test_shared_recording_captions_barge_in_and_cancel_over_real_eval_tran
 
     monkeypatch.setattr("openai.resources.chat.completions.AsyncCompletions.create", llm_response)
     monkeypatch.setattr(aiohttp.ClientSession, "post", post)
-    for key in [
-        "ELEVENLABS_API_KEY",
-        "ELEVENLABS_VOICE_ID",
-        "DEEPSEEK_API_KEY",
-        "VOLCENGINE_API_KEY",
-    ]:
+    for key in ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID", "DEEPSEEK_API_KEY"]:
         monkeypatch.setenv(key, "test-value")
-    monkeypatch.setenv("STT_PROVIDER", provider)
+    monkeypatch.delenv("VOLCENGINE_API_KEY", raising=False)
+    monkeypatch.delenv("VOLCENGINE_RESOURCE_ID", raising=False)
     monkeypatch.delenv("VOLCENGINE_STT_OPTIONS", raising=False)
+    for name in (
+        "VOLCENGINE_TTS_API_KEY",
+        "VOLCENGINE_TTS_RESOURCE_ID",
+        "VOLCENGINE_TTS_SPEAKER",
+        "VOLCENGINE_TTS_OPTIONS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    if provider == "volcengine":
+        monkeypatch.setenv("VOLCENGINE_API_KEY", "test-value")
+        monkeypatch.setenv("VOLCENGINE_RESOURCE_ID", "test-resource")
+    if tts_provider == "volcengine":
+        monkeypatch.setenv("VOLCENGINE_TTS_API_KEY", "test-value")
+        monkeypatch.setenv("VOLCENGINE_TTS_RESOURCE_ID", "test-resource")
+        monkeypatch.setenv("VOLCENGINE_TTS_SPEAKER", "test-speaker")
     runner_args = RunnerArguments()
     runner_args.handle_sigint = False
     app = runpy.run_path(str(ROOT / "local-voice-app" / "bot.py"))
@@ -257,14 +387,20 @@ async def test_shared_recording_captions_barge_in_and_cancel_over_real_eval_tran
             audio_in_enabled=True, audio_out_enabled=True, serializer=EvalSerializer()
         ),
     )
-    async with serve(recognition_peer, "127.0.0.1", 0) as peer:
 
-        async def provider_connect(url, **kwargs):
-            return await connect(f"ws://127.0.0.1:{peer.sockets[0].getsockname()[1]}", **kwargs)
+    async def provider_connect(url, **kwargs):
+        # Both providers open their realtime socket here, so the peer is chosen by
+        # the endpoint: synthesis for the TTS host, recognition otherwise.
+        endpoint = str(url)
+        assert endpoint.startswith(("wss://openspeech.bytedance.com/", "wss://api.elevenlabs.io/"))
+        peer = tts_peer_server if "tts/bidirection" in endpoint else recognition_peer_server
+        return await connect(f"ws://127.0.0.1:{peer.sockets[0].getsockname()[1]}", **kwargs)
 
-        monkeypatch.setattr(
-            "pipecat.services.websocket_service.websocket_connect", provider_connect
-        )
+    monkeypatch.setattr("pipecat.services.websocket_service.websocket_connect", provider_connect)
+    async with (
+        serve(recognition_peer, "127.0.0.1", 0) as recognition_peer_server,
+        serve(tts_peer, "127.0.0.1", 0) as tts_peer_server,
+    ):
         async with aiohttp.ClientSession() as session, asyncio.TaskGroup() as group:
             bot = group.create_task(app["run_bot_session"](transport, runner_args, session))
             try:
@@ -299,6 +435,19 @@ async def test_shared_recording_captions_barge_in_and_cancel_over_real_eval_tran
     assert peer_closed.is_set()
     if provider == "volcengine":
         assert options[0]["request"]["enable_nonstream"] is False
+    # The barge-in interrupted speech the bot had actually started, and the bot
+    # resumed for the second replay and tore down cleanly.
+    assert result["checks"]["barge_in_started_during_bot_speech"] is True
+    assert result["checks"]["bot_interrupted"] is True
+    if tts_provider == "volcengine":
+        assert tts_connected.is_set()
+        # The bot synthesized each turn's reply through Volcengine: the peer saw
+        # the LLM's text on every TaskRequest it was sent.
+        assert set(tts_requests) == {"Here is a spoken response."}
+        # Every session the service opened it also finished, so no session is left
+        # dangling at teardown.
+        assert tts_events.count(100) > 0  # StartSession
+        assert tts_events.count(102) == tts_events.count(100)  # FinishSession
 
 
 def test_final_segments_are_combined_and_complete_text_uses_last_arrival():
@@ -332,7 +481,7 @@ async def test_missing_credentials_skip_live_execution_without_exposing_values()
     assert result == {
         "provider": "volcengine",
         "status": "skipped",
-        "reason": "Missing VOLCENGINE_API_KEY",
+        "reason": "Missing VOLCENGINE_API_KEY, VOLCENGINE_RESOURCE_ID",
     }
 
 

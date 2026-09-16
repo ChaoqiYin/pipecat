@@ -109,6 +109,7 @@ async def test_partial_and_definite_results_become_standard_frames(compressed):
         port = server.sockets[0].getsockname()[1]
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{port}",
             audio_passthrough=False,
         )
@@ -120,6 +121,48 @@ async def test_partial_and_definite_results_become_standard_frames(compressed):
     ]
     assert transcripts[1].result["result"]["utterances"] == [utterance]
     assert transcripts[1].finalized is False
+
+
+@pytest.mark.asyncio
+async def test_request_options_are_serialized_by_protocol_model():
+    requests = []
+
+    async def handler(websocket):
+        requests.append(json.loads(gzip.decompress((await websocket.recv())[12:])))
+        await _acknowledge_end(websocket)
+
+    async with serve(handler, "127.0.0.1", 0) as server:
+        service = VolcengineSTTService(
+            api_key="test-key",
+            resource_id="test-resource",
+            ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+            params=VolcengineSTTService.InputParams(
+                enable_itn=True,
+                enable_punc=False,
+                corpus_context={"hotwords": ["Pipecat"]},
+            ),
+        )
+        await run_test(service, frames_to_send=[], start_timeout=5)
+
+    assert len(requests) == 1
+    request = requests[0]
+    UUID(request["user"]["uid"])
+    assert request["audio"] == {
+        "format": "pcm",
+        "codec": "raw",
+        "rate": 16000,
+        "bits": 16,
+        "channel": 1,
+    }
+    assert request["request"] == {
+        "model_name": "bigmodel",
+        "result_type": "single",
+        "show_utterances": True,
+        "enable_nonstream": False,
+        "enable_itn": True,
+        "enable_punc": False,
+        "corpus": {"context": '{"hotwords": ["Pipecat"]}'},
+    }
 
 
 @pytest.mark.asyncio
@@ -222,7 +265,10 @@ async def test_protocol_failures_emit_nonfatal_error_with_request_id(message, ex
     async with serve(handler, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
         service = VolcengineSTTService(
-            api_key="test-key", ws_url=f"ws://127.0.0.1:{port}", reconnect_on_error=False
+            api_key="test-key",
+            resource_id="test-resource",
+            ws_url=f"ws://127.0.0.1:{port}",
+            reconnect_on_error=False,
         )
         errors = await _run_until_results(service, 1)
 
@@ -248,6 +294,7 @@ async def test_large_audio_frame_is_sent_as_bounded_pcm_packets():
         port = server.sockets[0].getsockname()[1]
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{port}",
             sample_rate=16000,
         )
@@ -277,7 +324,9 @@ async def test_definite_segments_deduplicate_by_position_and_preserve_repeated_t
 
     async with serve(handler, "127.0.0.1", 0) as server:
         service = VolcengineSTTService(
-            api_key="test-key", ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+            api_key="test-key",
+            resource_id="test-resource",
+            ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
         )
         frames = await _run_until_results(service, 3)
 
@@ -317,6 +366,7 @@ async def test_normal_end_waits_for_final_marker_and_delivers_tail_transcript():
     async with serve(handler, "127.0.0.1", 0) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
             audio_passthrough=False,
         )
@@ -343,6 +393,7 @@ async def test_normal_end_times_out_when_peer_never_marks_response_final():
     async with serve(handler, "127.0.0.1", 0) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
             flush_timeout=0.05,
         )
@@ -412,6 +463,7 @@ async def test_reconnect_resets_stream_and_discards_audio_received_during_outage
     async with serve(handler, "127.0.0.1", 0, process_request=process_request) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
             reconnect_backoff_min_wait=0.01,
             reconnect_backoff_max_wait=0.01,
@@ -481,6 +533,7 @@ async def test_blocked_audio_send_recovers_without_replaying_queued_audio(monkey
     async with serve(handler, "127.0.0.1", 0) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
             send_timeout=0.05,
             reconnect_backoff_min_wait=0.01,
@@ -522,6 +575,7 @@ async def test_audio_queue_overflow_drops_backlog_and_reports_error():
     async with serve(handler, "127.0.0.1", 0) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
         )
         _, up = await run_test(
@@ -567,6 +621,7 @@ async def test_interruption_and_silence_keep_stream_open_for_resumed_speech():
     async with serve(handler, "127.0.0.1", 0) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
             audio_passthrough=False,
         )
@@ -621,6 +676,7 @@ async def test_cancel_releases_blocked_sender_and_connection_without_flushing(mo
     async with serve(handler, "127.0.0.1", 0) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
             send_timeout=10,
             flush_timeout=10,
@@ -656,6 +712,7 @@ async def test_handshake_failure_emits_error_and_releases_resources():
     async with serve(handler, "127.0.0.1", 0, process_request=reject) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
         )
         observer = _ResultObserver(service, 1)
@@ -683,6 +740,7 @@ async def test_reconnect_exhaustion_emits_errors_with_attempt_request_ids():
     async with serve(handler, "127.0.0.1", 0, process_request=reject_reconnect) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
             reconnect_backoff_min_wait=0.01,
             reconnect_backoff_max_wait=0.01,
@@ -711,6 +769,7 @@ async def test_definite_result_without_segment_position_reports_protocol_error()
     async with serve(handler, "127.0.0.1", 0) as server:
         service = VolcengineSTTService(
             api_key="test-key",
+            resource_id="test-resource",
             ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
         )
         frames = await _run_until_results(service, 1)
@@ -719,8 +778,30 @@ async def test_definite_result_without_segment_position_reports_protocol_error()
     assert "timestamps" in frames[0].error
 
 
+@pytest.mark.asyncio
+async def test_invalid_response_model_emits_nonfatal_error():
+    async def handler(websocket):
+        await websocket.recv()
+        await websocket.recv()
+        await websocket.send(_response({"result": {"utterances": "not a list"}}))
+        await _acknowledge_end(websocket)
+
+    async with serve(handler, "127.0.0.1", 0) as server:
+        service = VolcengineSTTService(
+            api_key="test-key",
+            resource_id="test-resource",
+            ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+        )
+        frames = await _run_until_results(service, 1)
+
+    assert len(frames) == 1
+    assert isinstance(frames[0], ErrorFrame)
+    assert "utterances" in frames[0].error
+    assert frames[0].fatal is False
+
+
 @pytest.mark.parametrize("setting", ["flush_timeout", "send_timeout"])
 @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
 def test_timeout_must_be_finite_and_positive(setting, value):
     with pytest.raises(ValueError, match="finite and positive"):
-        VolcengineSTTService(api_key="test-key", **{setting: value})
+        VolcengineSTTService(api_key="test-key", resource_id="test-resource", **{setting: value})

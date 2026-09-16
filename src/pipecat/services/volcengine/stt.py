@@ -18,7 +18,7 @@ import zlib
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from websockets.protocol import State
 
 from pipecat.frames.frames import (
@@ -45,7 +45,87 @@ def _encode_request(payload: bytes, sequence: int, *, audio: bool = False) -> by
     return header + struct.pack(">iI", sequence, len(body)) + body
 
 
-def _decode_response(message: bytes | str) -> tuple[dict, bool]:
+class _RequestUser(BaseModel):
+    """Volcengine request user identity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    uid: str
+
+
+class _RequestAudio(BaseModel):
+    """Volcengine request audio format."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    format: str = "pcm"
+    codec: str = "raw"
+    rate: int
+    bits: int = 16
+    channel: int = 1
+
+
+class _RequestCorpus(BaseModel):
+    """Volcengine request corpus configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    context: str
+
+
+class _RecognitionRequest(BaseModel):
+    """Volcengine streaming recognition request payload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str = "bigmodel"
+    result_type: str = "single"
+    show_utterances: bool = True
+    enable_nonstream: bool = False
+    enable_itn: bool | None = None
+    enable_punc: bool | None = None
+    corpus: _RequestCorpus | None = None
+
+
+class _StreamingRecognitionRequest(BaseModel):
+    """Complete Volcengine streaming recognition request payload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    user: _RequestUser
+    audio: _RequestAudio
+    request: _RecognitionRequest
+
+
+class _RecognitionUtterance(BaseModel):
+    """One recognition utterance in a Volcengine response."""
+
+    model_config = ConfigDict(extra="allow")
+
+    text: str = ""
+    definite: bool = False
+    start_time: int | None = None
+    end_time: int | None = None
+
+
+class _RecognitionResult(BaseModel):
+    """Recognition result in a Volcengine response."""
+
+    model_config = ConfigDict(extra="allow")
+
+    text: str = ""
+    utterances: list[_RecognitionUtterance] = Field(default_factory=list)
+
+
+class _StreamingRecognitionResponse(BaseModel):
+    """Volcengine streaming recognition response payload."""
+
+    model_config = ConfigDict(extra="allow")
+
+    result: _RecognitionResult = Field(default_factory=_RecognitionResult)
+
+
+def _decode_response(message: bytes | str) -> tuple[_StreamingRecognitionResponse, bool]:
     """Decode a full server response or raise a descriptive protocol error."""
     if not isinstance(message, bytes):
         raise ValueError("Expected a binary response")
@@ -85,7 +165,7 @@ def _decode_response(message: bytes | str) -> tuple[dict, bool]:
         raise ValueError("Invalid JSON response") from exc
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object")
-    return data, bool(flags & 0x2)
+    return _StreamingRecognitionResponse.model_validate(data), bool(flags & 0x2)
 
 
 class VolcengineSTTService(WebsocketSTTService):
@@ -117,7 +197,7 @@ class VolcengineSTTService(WebsocketSTTService):
         self,
         *,
         api_key: str,
-        resource_id: str = "volc.seedasr.sauc.duration",
+        resource_id: str,
         ws_url: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
         sample_rate: int | None = None,
         flush_timeout: float = 2.0,
@@ -285,32 +365,25 @@ class VolcengineSTTService(WebsocketSTTService):
                 "X-Api-Request-Id": self._request_id,
             },
         )
-        request = {
-            "user": {"uid": self._request_id},
-            "audio": {
-                "format": "pcm",
-                "codec": "raw",
-                "rate": self.sample_rate,
-                "bits": 16,
-                "channel": 1,
-            },
-            "request": {
-                "model_name": "bigmodel",
-                "result_type": "single",
-                "show_utterances": True,
-                "enable_nonstream": False,
-            },
-        }
-        request["request"].update(
-            self._params.model_dump(exclude_none=True, exclude={"corpus_context"})
+        request = _StreamingRecognitionRequest(
+            user=_RequestUser(uid=self._request_id),
+            audio=_RequestAudio(rate=self.sample_rate),
+            request=_RecognitionRequest(
+                **self._params.model_dump(exclude_none=True, exclude={"corpus_context"}),
+                corpus=(
+                    _RequestCorpus(
+                        context=json.dumps(self._params.corpus_context, ensure_ascii=False)
+                    )
+                    if self._params.corpus_context is not None
+                    else None
+                ),
+            ),
         )
-        if self._params.corpus_context is not None:
-            request["request"]["corpus"] = {
-                "context": json.dumps(self._params.corpus_context, ensure_ascii=False)
-            }
         assert self._websocket is not None
         try:
-            await self._send_packet(json.dumps(request).encode(), self._sequence)
+            await self._send_packet(
+                request.model_dump_json(exclude_none=True).encode(), self._sequence
+            )
         except BaseException:
             await self._disconnect_websocket()
             raise
@@ -350,35 +423,33 @@ class VolcengineSTTService(WebsocketSTTService):
         if self._websocket:
             async for message in self._websocket:
                 try:
-                    data, is_final = _decode_response(message)
-                    result = data.get("result", {})
-                    utterances = result.get("utterances", [])
+                    response, is_final = _decode_response(message)
+                    result = response.result
+                    utterances = result.utterances
                     if not utterances:
-                        utterances = [{"text": result.get("text", ""), "definite": False}]
+                        utterances = [_RecognitionUtterance(text=result.text)]
                     for utterance in utterances:
-                        text = utterance.get("text", "")
+                        text = utterance.text
                         if not text:
                             continue
-                        if utterance.get("definite"):
-                            start = utterance.get("start_time")
-                            end = utterance.get("end_time")
-                            if not isinstance(start, int) or not isinstance(end, int):
+                        if utterance.definite:
+                            start = utterance.start_time
+                            end = utterance.end_time
+                            if start is None or end is None:
                                 raise ValueError("Definite segment is missing integer timestamps")
                             segment = (self._request_id, start, end)
                             if segment in self._committed_segments:
                                 continue
                             self._committed_segments.add(segment)
                         frame_type = (
-                            TranscriptionFrame
-                            if utterance.get("definite")
-                            else InterimTranscriptionFrame
+                            TranscriptionFrame if utterance.definite else InterimTranscriptionFrame
                         )
                         await self.push_frame(
                             frame_type(
                                 text,
                                 self._user_id,
                                 time_now_iso8601(),
-                                result=data,
+                                result=response.model_dump(exclude_unset=True),
                             )
                         )
                     if is_final:
