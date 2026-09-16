@@ -158,7 +158,7 @@ async def test_request_options_are_serialized_by_protocol_model():
         "model_name": "bigmodel",
         "result_type": "single",
         "show_utterances": True,
-        "enable_nonstream": False,
+        "enable_nonstream": True,
         "enable_itn": True,
         "enable_punc": False,
         "corpus": {"context": '{"hotwords": ["Pipecat"]}'},
@@ -222,7 +222,7 @@ async def test_stream_authenticates_and_sends_sequenced_pcm_with_end_marker():
         }
         assert request["request"]["result_type"] == "single"
         assert request["request"]["show_utterances"] is True
-        assert request["request"]["enable_nonstream"] is False
+        assert request["request"]["enable_nonstream"] is True
         assert [gzip.decompress(message[12:]) for message in messages[1:]] == [
             b"\x01\x00" * 160,
             b"\x02\x00" * 160,
@@ -757,7 +757,34 @@ async def test_reconnect_exhaustion_emits_errors_with_attempt_request_ids():
 
 
 @pytest.mark.asyncio
-async def test_definite_result_without_segment_position_reports_protocol_error():
+async def test_second_pass_segment_without_start_time_becomes_final_once():
+    # Second-pass segments carry an end timestamp and no start timestamp.
+    segment = {"text": "Okay.", "definite": True, "end_time": 2902}
+
+    async def handler(websocket):
+        await websocket.recv()
+        await websocket.recv()
+        for utterances in ([segment], [segment]):
+            await websocket.send(_response({"result": {"utterances": utterances}}))
+        await websocket.send(_response({"result": {"text": "Done"}}))
+        await _acknowledge_end(websocket)
+
+    async with serve(handler, "127.0.0.1", 0) as server:
+        service = VolcengineSTTService(
+            api_key="test-key",
+            resource_id="test-resource",
+            ws_url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+        )
+        frames = await _run_until_results(service, 2)
+
+    assert [(type(frame), frame.text) for frame in frames] == [
+        (TranscriptionFrame, "Okay."),
+        (InterimTranscriptionFrame, "Done"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_definite_result_without_end_timestamp_reports_protocol_error():
     async def handler(websocket):
         await websocket.recv()
         await websocket.recv()
@@ -775,7 +802,7 @@ async def test_definite_result_without_segment_position_reports_protocol_error()
         frames = await _run_until_results(service, 1)
     assert len(frames) == 1
     assert isinstance(frames[0], ErrorFrame)
-    assert "timestamps" in frames[0].error
+    assert "timestamp" in frames[0].error
 
 
 @pytest.mark.asyncio

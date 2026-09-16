@@ -121,17 +121,26 @@ def test_provider_environment_isolated_without_mutating_backend_configuration():
     config = {
         "ELEVENLABS_API_KEY": "eleven-key",
         "VOLCENGINE_API_KEY": "volc-key",
-        "VOLCENGINE_RESOURCE_ID": "volc-resource",
         "VOLCENGINE_STT_OPTIONS": '{"enable_punc":true}',
+        "VOLCENGINE_TTS_SPEAKER": "volc-speaker",
+        # The application rejects retired settings, so no replayed process may
+        # inherit one.
+        "VOLCENGINE_TTS_API_KEY": "retired-key",
     }
 
     elevenlabs_environment = build_environment("elevenlabs", config)
     volcengine_environment = build_environment("volcengine", config)
 
     assert "VOLCENGINE_API_KEY" not in elevenlabs_environment
-    assert "VOLCENGINE_RESOURCE_ID" not in elevenlabs_environment
     assert "VOLCENGINE_STT_OPTIONS" not in elevenlabs_environment
-    assert volcengine_environment == config
+    assert "VOLCENGINE_TTS_SPEAKER" not in elevenlabs_environment
+    assert "VOLCENGINE_TTS_API_KEY" not in volcengine_environment
+    assert volcengine_environment == {
+        "ELEVENLABS_API_KEY": "eleven-key",
+        "VOLCENGINE_API_KEY": "volc-key",
+        "VOLCENGINE_STT_OPTIONS": '{"enable_punc":true}',
+        "VOLCENGINE_TTS_SPEAKER": "volc-speaker",
+    }
     assert config["VOLCENGINE_API_KEY"] == "volc-key"
 
 
@@ -176,8 +185,16 @@ def _decode_client_event(message: bytes) -> tuple[int, str, dict]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider", ["elevenlabs", "volcengine"])
-@pytest.mark.parametrize("tts_provider", ["elevenlabs", "volcengine"])
+@pytest.mark.parametrize(
+    "provider, tts_provider",
+    [
+        ("elevenlabs", "elevenlabs"),
+        # Volcengine synthesis needs the shared API key, and that key also selects
+        # Volcengine recognition.
+        ("volcengine", "elevenlabs"),
+        ("volcengine", "volcengine"),
+    ],
+)
 async def test_shared_recording_captions_barge_in_and_cancel_over_real_eval_transport(
     provider, tts_provider, monkeypatch, aiohttp_server, unused_tcp_port
 ):
@@ -359,10 +376,10 @@ async def test_shared_recording_captions_barge_in_and_cancel_over_real_eval_tran
     monkeypatch.setattr(aiohttp.ClientSession, "post", post)
     for key in ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID", "DEEPSEEK_API_KEY"]:
         monkeypatch.setenv(key, "test-value")
-    monkeypatch.delenv("VOLCENGINE_API_KEY", raising=False)
-    monkeypatch.delenv("VOLCENGINE_RESOURCE_ID", raising=False)
-    monkeypatch.delenv("VOLCENGINE_STT_OPTIONS", raising=False)
     for name in (
+        "VOLCENGINE_API_KEY",
+        "VOLCENGINE_RESOURCE_ID",
+        "VOLCENGINE_STT_OPTIONS",
         "VOLCENGINE_TTS_API_KEY",
         "VOLCENGINE_TTS_RESOURCE_ID",
         "VOLCENGINE_TTS_SPEAKER",
@@ -371,10 +388,7 @@ async def test_shared_recording_captions_barge_in_and_cancel_over_real_eval_tran
         monkeypatch.delenv(name, raising=False)
     if provider == "volcengine":
         monkeypatch.setenv("VOLCENGINE_API_KEY", "test-value")
-        monkeypatch.setenv("VOLCENGINE_RESOURCE_ID", "test-resource")
     if tts_provider == "volcengine":
-        monkeypatch.setenv("VOLCENGINE_TTS_API_KEY", "test-value")
-        monkeypatch.setenv("VOLCENGINE_TTS_RESOURCE_ID", "test-resource")
         monkeypatch.setenv("VOLCENGINE_TTS_SPEAKER", "test-speaker")
     runner_args = RunnerArguments()
     runner_args.handle_sigint = False
@@ -434,7 +448,7 @@ async def test_shared_recording_captions_barge_in_and_cancel_over_real_eval_tran
     )
     assert peer_closed.is_set()
     if provider == "volcengine":
-        assert options[0]["request"]["enable_nonstream"] is False
+        assert options[0]["request"]["enable_nonstream"] is True
     # The barge-in interrupted speech the bot had actually started, and the bot
     # resumed for the second replay and tore down cleanly.
     assert result["checks"]["barge_in_started_during_bot_speech"] is True
@@ -481,7 +495,7 @@ async def test_missing_credentials_skip_live_execution_without_exposing_values()
     assert result == {
         "provider": "volcengine",
         "status": "skipped",
-        "reason": "Missing VOLCENGINE_API_KEY, VOLCENGINE_RESOURCE_ID",
+        "reason": "Missing VOLCENGINE_API_KEY, VOLCENGINE_TTS_SPEAKER",
     }
 
 

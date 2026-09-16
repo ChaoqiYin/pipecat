@@ -26,8 +26,17 @@ from websockets.exceptions import ConnectionClosed
 ROOT = Path(__file__).resolve().parents[1]
 VOLCENGINE_STT_SETTINGS = (
     "VOLCENGINE_API_KEY",
-    "VOLCENGINE_RESOURCE_ID",
     "VOLCENGINE_STT_OPTIONS",
+)
+VOLCENGINE_TTS_SETTINGS = (
+    "VOLCENGINE_TTS_SPEAKER",
+    "VOLCENGINE_TTS_OPTIONS",
+)
+# Settings the application rejects, so no replayed process may inherit them.
+RETIRED_VOLCENGINE_SETTINGS = (
+    "VOLCENGINE_TTS_API_KEY",
+    "VOLCENGINE_RESOURCE_ID",
+    "VOLCENGINE_TTS_RESOURCE_ID",
 )
 
 
@@ -306,9 +315,13 @@ async def run_provider(provider: str, args: argparse.Namespace, config: dict[str
     Returns:
         A measured result, or an explicit skipped/failed result.
     """
-    required = ["ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID", "DEEPSEEK_API_KEY"]
+    required = ["DEEPSEEK_API_KEY"]
     if provider == "volcengine":
-        required.extend(("VOLCENGINE_API_KEY", "VOLCENGINE_RESOURCE_ID"))
+        # Selection follows the shared API key, so the replayed application also
+        # synthesizes through Volcengine and needs its voice.
+        required.extend(("VOLCENGINE_API_KEY", "VOLCENGINE_TTS_SPEAKER"))
+    else:
+        required.extend(("ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID"))
     missing = [key for key in required if not config.get(key, "").strip()]
     if missing:
         return {
@@ -382,8 +395,12 @@ async def run_provider(provider: str, args: argparse.Namespace, config: dict[str
 def _provider_environment(provider: str, config: dict[str, str]) -> dict[str, str]:
     """Build an isolated backend environment for one recognition provider."""
     environment = config.copy()
+    for name in RETIRED_VOLCENGINE_SETTINGS:
+        environment.pop(name, None)
     if provider == "elevenlabs":
-        for name in VOLCENGINE_STT_SETTINGS:
+        # The API key configures both modalities, so isolating recognition also
+        # removes the synthesis settings that depend on it.
+        for name in VOLCENGINE_STT_SETTINGS + VOLCENGINE_TTS_SETTINGS:
             environment.pop(name, None)
     return environment
 

@@ -75,7 +75,6 @@ async def test_volcengine_backend_options_reach_recognition_peer(monkeypatch):
         service = app["create_stt_service"](
             {
                 "VOLCENGINE_API_KEY": "volc-test-key",
-                "VOLCENGINE_RESOURCE_ID": "test-resource",
                 "VOLCENGINE_STT_OPTIONS": json.dumps(
                     {
                         "enable_itn": False,
@@ -89,12 +88,12 @@ async def test_volcengine_backend_options_reach_recognition_peer(monkeypatch):
         await run_test(service, frames_to_send=[], start_timeout=5)
 
     assert headers[0]["X-Api-Key"] == "volc-test-key"
-    assert headers[0]["X-Api-Resource-Id"] == "test-resource"
+    assert headers[0]["X-Api-Resource-Id"] == "volc.seedasr.sauc.duration"
     assert requests[0]["request"] == {
         "model_name": "bigmodel",
         "result_type": "single",
         "show_utterances": True,
-        "enable_nonstream": False,
+        "enable_nonstream": True,
         "enable_itn": False,
         "enable_punc": True,
         "corpus": {"context": '{"hotwords": [{"word": "Pipecat"}]}'},
@@ -110,7 +109,6 @@ async def test_volcengine_backend_options_reach_recognition_peer(monkeypatch):
             (
                 {
                     "VOLCENGINE_API_KEY": "secret-test-key",
-                    "VOLCENGINE_RESOURCE_ID": "test-resource",
                     "VOLCENGINE_STT_OPTIONS": options,
                 },
                 "VOLCENGINE_STT_OPTIONS",
@@ -134,13 +132,11 @@ def test_invalid_backend_configuration_fails_without_disclosing_values(config, e
 @pytest.mark.parametrize(
     "config, expected",
     [
-        ({"VOLCENGINE_API_KEY": "volc-test-key"}, "VOLCENGINE_RESOURCE_ID"),
-        ({"VOLCENGINE_RESOURCE_ID": "test-resource"}, "VOLCENGINE_API_KEY"),
-        (
-            {"VOLCENGINE_API_KEY": "volc-test-key", "VOLCENGINE_RESOURCE_ID": " "},
-            "VOLCENGINE_RESOURCE_ID",
-        ),
         ({"VOLCENGINE_STT_OPTIONS": "{}"}, "VOLCENGINE_API_KEY"),
+        (
+            {"VOLCENGINE_API_KEY": " ", "VOLCENGINE_STT_OPTIONS": "{}"},
+            "VOLCENGINE_API_KEY",
+        ),
     ],
 )
 def test_incomplete_volcengine_configuration_fails_clearly(config, expected):
@@ -148,6 +144,28 @@ def test_incomplete_volcengine_configuration_fails_clearly(config, expected):
     with pytest.raises(ValueError, match=expected) as error:
         app["create_stt_service"]({"ELEVENLABS_API_KEY": "test-key", **config})
     assert "volc-test-key" not in str(error.value)
+
+
+def test_volcengine_recognition_pins_the_model_version():
+    app = runpy.run_path(str(APP))
+    service = app["create_stt_service"]({"VOLCENGINE_API_KEY": "volc-test-key"})
+    assert isinstance(service, VolcengineSTTService)
+    assert service._resource_id == "volc.seedasr.sauc.duration"
+
+
+@pytest.mark.parametrize(
+    "config, expected",
+    [
+        ({"VOLCENGINE_RESOURCE_ID": "secret-resource"}, "VOLCENGINE_RESOURCE_ID"),
+        ({"VOLCENGINE_TTS_API_KEY": "secret-key"}, "VOLCENGINE_TTS_API_KEY"),
+        ({"VOLCENGINE_TTS_RESOURCE_ID": "secret-resource"}, "VOLCENGINE_TTS_RESOURCE_ID"),
+    ],
+)
+def test_retired_volcengine_settings_fail_without_disclosing_values(config, expected):
+    app = runpy.run_path(str(APP))
+    with pytest.raises(ValueError, match=expected) as error:
+        app["create_stt_service"]({"ELEVENLABS_API_KEY": "test-key", **config})
+    assert "secret-" not in str(error.value)
 
 
 @pytest.mark.asyncio
@@ -179,11 +197,18 @@ async def test_selected_provider_uses_existing_voice_pipeline(provider, monkeypa
     monkeypatch.setenv("ELEVENLABS_API_KEY", "eleven-test-key")
     monkeypatch.setenv("ELEVENLABS_VOICE_ID", "test-voice")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test-key")
-    monkeypatch.delenv("VOLCENGINE_API_KEY", raising=False)
-    monkeypatch.delenv("VOLCENGINE_RESOURCE_ID", raising=False)
+    for name in (
+        "VOLCENGINE_API_KEY",
+        "VOLCENGINE_RESOURCE_ID",
+        "VOLCENGINE_STT_OPTIONS",
+        "VOLCENGINE_TTS_API_KEY",
+        "VOLCENGINE_TTS_RESOURCE_ID",
+        "VOLCENGINE_TTS_SPEAKER",
+        "VOLCENGINE_TTS_OPTIONS",
+    ):
+        monkeypatch.delenv(name, raising=False)
     if provider == "volcengine":
         monkeypatch.setenv("VOLCENGINE_API_KEY", "volc-test-key")
-        monkeypatch.setenv("VOLCENGINE_RESOURCE_ID", "test-resource")
     transport = Transport()
     app = runpy.run_path(str(APP))
     async with aiohttp.ClientSession() as session:
@@ -232,8 +257,7 @@ async def test_volcengine_synthesis_configuration_reaches_service(config, expect
         service = app["create_tts_service"](
             session,
             {
-                "VOLCENGINE_TTS_API_KEY": "volc-test-key",
-                "VOLCENGINE_TTS_RESOURCE_ID": "seed-tts-2.0",
+                "VOLCENGINE_API_KEY": "volc-test-key",
                 "VOLCENGINE_TTS_SPEAKER": "test-speaker",
                 **config,
             },
@@ -253,31 +277,15 @@ async def test_volcengine_synthesis_configuration_reaches_service(config, expect
 @pytest.mark.parametrize(
     "config, expected",
     [
-        ({"VOLCENGINE_TTS_API_KEY": "volc-test-key"}, "VOLCENGINE_TTS_RESOURCE_ID"),
-        ({"VOLCENGINE_TTS_RESOURCE_ID": "seed-tts-2.0"}, "VOLCENGINE_TTS_API_KEY"),
+        ({"VOLCENGINE_TTS_OPTIONS": "{}"}, "VOLCENGINE_API_KEY"),
+        ({"VOLCENGINE_TTS_SPEAKER": "test-speaker"}, "VOLCENGINE_API_KEY"),
         (
-            {"VOLCENGINE_TTS_API_KEY": "volc-test-key", "VOLCENGINE_TTS_RESOURCE_ID": " "},
-            "VOLCENGINE_TTS_RESOURCE_ID",
-        ),
-        (
-            {"VOLCENGINE_TTS_RESOURCE_ID": "seed-tts-2.0", "VOLCENGINE_TTS_OPTIONS": "{}"},
-            "VOLCENGINE_TTS_API_KEY",
-        ),
-        ({"VOLCENGINE_TTS_OPTIONS": "{}"}, "VOLCENGINE_TTS_API_KEY"),
-        (
-            {
-                "VOLCENGINE_TTS_API_KEY": "volc-test-key",
-                "VOLCENGINE_TTS_RESOURCE_ID": "seed-tts-2.0",
-            },
+            {"VOLCENGINE_API_KEY": "volc-test-key", "VOLCENGINE_TTS_SPEAKER": " "},
             "VOLCENGINE_TTS_SPEAKER",
         ),
         (
-            {
-                "VOLCENGINE_TTS_API_KEY": "volc-test-key",
-                "VOLCENGINE_TTS_RESOURCE_ID": "seed-tts-2.0",
-                "VOLCENGINE_TTS_SPEAKER": " ",
-            },
-            "VOLCENGINE_TTS_SPEAKER",
+            {"VOLCENGINE_API_KEY": " ", "VOLCENGINE_TTS_OPTIONS": "{}"},
+            "VOLCENGINE_API_KEY",
         ),
     ],
 )
@@ -308,8 +316,7 @@ async def test_invalid_volcengine_synthesis_options_fail_without_disclosing_valu
             app["create_tts_service"](
                 session,
                 {
-                    "VOLCENGINE_TTS_API_KEY": "volc-test-key",
-                    "VOLCENGINE_TTS_RESOURCE_ID": "seed-tts-2.0",
+                    "VOLCENGINE_API_KEY": "volc-test-key",
                     "VOLCENGINE_TTS_SPEAKER": "test-speaker",
                     "VOLCENGINE_TTS_OPTIONS": options,
                 },
@@ -321,29 +328,27 @@ async def test_invalid_volcengine_synthesis_options_fail_without_disclosing_valu
 @pytest.mark.parametrize(
     "config, tts_expected, stt_expected",
     [
+        # The shared key alone selects Volcengine recognition; synthesis stays on
+        # ElevenLabs until a synthesis setting appears.
         (
-            {"VOLCENGINE_API_KEY": "volc-test-key", "VOLCENGINE_RESOURCE_ID": "test-resource"},
+            {"VOLCENGINE_API_KEY": "volc-test-key"},
             ElevenLabsHttpTTSService,
             VolcengineSTTService,
         ),
+        # A lone recognition option also selects Volcengine recognition, which then
+        # requires the shared key.
         (
             {"VOLCENGINE_STT_OPTIONS": "{}"},
             ElevenLabsHttpTTSService,
-            # A lone recognition option still selects Volcengine recognition, which
-            # then requires the full credential pair.
             None,
         ),
         (
-            {
-                "VOLCENGINE_TTS_API_KEY": "volc-test-key",
-                "VOLCENGINE_TTS_RESOURCE_ID": "seed-tts-2.0",
-                "VOLCENGINE_TTS_SPEAKER": "test-speaker",
-            },
+            {"VOLCENGINE_API_KEY": "volc-test-key", "VOLCENGINE_TTS_SPEAKER": "test-speaker"},
             VolcengineTTSService,
-            ElevenLabsRealtimeSTTService,
+            VolcengineSTTService,
         ),
-        # A lone synthesis option still selects Volcengine synthesis, which then
-        # requires the full credential set.
+        # A lone synthesis option selects Volcengine synthesis, which then requires
+        # the shared key and the voice.
         ({"VOLCENGINE_TTS_OPTIONS": "{}"}, None, ElevenLabsRealtimeSTTService),
     ],
 )
@@ -354,7 +359,7 @@ async def test_synthesis_and_recognition_selection_are_independent(
     config = {"ELEVENLABS_API_KEY": "test-key", **config}
     async with aiohttp.ClientSession() as session:
         if tts_expected is None:
-            with pytest.raises(ValueError, match="VOLCENGINE_TTS_API_KEY"):
+            with pytest.raises(ValueError, match="VOLCENGINE_API_KEY"):
                 app["create_tts_service"](session, config)
         else:
             assert isinstance(app["create_tts_service"](session, config), tts_expected)
@@ -367,8 +372,7 @@ async def test_synthesis_and_recognition_selection_are_independent(
 
 @pytest.mark.asyncio
 async def test_volcengine_synthesis_does_not_require_elevenlabs_key(monkeypatch):
-    monkeypatch.setenv("VOLCENGINE_TTS_API_KEY", "volc-test-key")
-    monkeypatch.setenv("VOLCENGINE_TTS_RESOURCE_ID", "seed-tts-2.0")
+    monkeypatch.setenv("VOLCENGINE_API_KEY", "volc-test-key")
     monkeypatch.setenv("VOLCENGINE_TTS_SPEAKER", "test-speaker")
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
     app = runpy.run_path(str(APP))
@@ -379,7 +383,6 @@ async def test_volcengine_synthesis_does_not_require_elevenlabs_key(monkeypatch)
 @pytest.mark.asyncio
 async def test_volcengine_session_still_requires_elevenlabs_tts_key(monkeypatch):
     monkeypatch.setenv("VOLCENGINE_API_KEY", "volc-test-key")
-    monkeypatch.setenv("VOLCENGINE_RESOURCE_ID", "test-resource")
     monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
     app = runpy.run_path(str(APP))
     async with aiohttp.ClientSession() as session:

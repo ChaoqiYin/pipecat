@@ -46,18 +46,28 @@ transport_params = {
 
 VOLCENGINE_STT_SETTINGS = (
     "VOLCENGINE_API_KEY",
-    "VOLCENGINE_RESOURCE_ID",
     "VOLCENGINE_STT_OPTIONS",
 )
 
 VOLCENGINE_TTS_SETTINGS = (
-    "VOLCENGINE_TTS_API_KEY",
-    "VOLCENGINE_TTS_RESOURCE_ID",
     "VOLCENGINE_TTS_SPEAKER",
     "VOLCENGINE_TTS_OPTIONS",
 )
 
 ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
+
+# The provider selects the model version with its X-Api-Resource-Id header. The
+# application targets one version per modality, so the values are fixed here
+# rather than read from configuration.
+VOLCENGINE_STT_RESOURCE_ID = "volc.seedasr.sauc.duration"
+VOLCENGINE_TTS_RESOURCE_ID = "seed-tts-2.0"
+
+# Settings that the shared API key or the fixed model versions replaced.
+RETIRED_VOLCENGINE_SETTINGS = {
+    "VOLCENGINE_TTS_API_KEY": "use VOLCENGINE_API_KEY",
+    "VOLCENGINE_RESOURCE_ID": "the recognition model version is fixed",
+    "VOLCENGINE_TTS_RESOURCE_ID": "the synthesis model version is fixed",
+}
 
 
 def _required_setting(config: Mapping[str, str], name: str) -> str:
@@ -65,6 +75,12 @@ def _required_setting(config: Mapping[str, str], name: str) -> str:
     if not value:
         raise ValueError(f"{name} is required in backend configuration")
     return value
+
+
+def _reject_retired_settings(config: Mapping[str, str]) -> None:
+    for name, guidance in RETIRED_VOLCENGINE_SETTINGS.items():
+        if name in config:
+            raise ValueError(f"{name} is no longer used in backend configuration; {guidance}")
 
 
 def create_stt_service(environ: Mapping[str, str] | None = None) -> STTService:
@@ -77,13 +93,13 @@ def create_stt_service(environ: Mapping[str, str] | None = None) -> STTService:
         The configured recognition service.
 
     Raises:
-        ValueError: A recognition option is invalid.
+        ValueError: A recognition setting is retired, missing, or invalid.
     """
     config = os.environ if environ is None else environ
+    _reject_retired_settings(config)
     if not any(name in config for name in VOLCENGINE_STT_SETTINGS):
         return ElevenLabsRealtimeSTTService(api_key=_required_setting(config, "ELEVENLABS_API_KEY"))
     api_key = _required_setting(config, "VOLCENGINE_API_KEY")
-    resource_id = _required_setting(config, "VOLCENGINE_RESOURCE_ID")
     try:
         params = VolcengineSTTService.InputParams.model_validate_json(
             config.get("VOLCENGINE_STT_OPTIONS", "{}")
@@ -91,9 +107,11 @@ def create_stt_service(environ: Mapping[str, str] | None = None) -> STTService:
     except ValidationError:
         raise ValueError(
             "VOLCENGINE_STT_OPTIONS must be a JSON object with supported recognition options; "
-            "second-pass recognition is not supported"
+            "the second-pass setting is fixed"
         ) from None
-    return VolcengineSTTService(api_key=api_key, resource_id=resource_id, params=params)
+    return VolcengineSTTService(
+        api_key=api_key, resource_id=VOLCENGINE_STT_RESOURCE_ID, params=params
+    )
 
 
 def create_tts_service(
@@ -109,9 +127,10 @@ def create_tts_service(
         The configured synthesis service.
 
     Raises:
-        ValueError: A synthesis setting is missing or an option is invalid.
+        ValueError: A synthesis setting is retired, missing, or an option is invalid.
     """
     config = os.environ if environ is None else environ
+    _reject_retired_settings(config)
     if not any(name in config for name in VOLCENGINE_TTS_SETTINGS):
         return ElevenLabsHttpTTSService(
             aiohttp_session=session,
@@ -121,8 +140,7 @@ def create_tts_service(
                 model=ELEVENLABS_TTS_MODEL,
             ),
         )
-    api_key = _required_setting(config, "VOLCENGINE_TTS_API_KEY")
-    resource_id = _required_setting(config, "VOLCENGINE_TTS_RESOURCE_ID")
+    api_key = _required_setting(config, "VOLCENGINE_API_KEY")
     speaker = _required_setting(config, "VOLCENGINE_TTS_SPEAKER")
     options = config.get("VOLCENGINE_TTS_OPTIONS", "{}")
     try:
@@ -137,7 +155,9 @@ def create_tts_service(
             "VOLCENGINE_TTS_OPTIONS must be a JSON object with supported synthesis options "
             "and must not set the voice"
         ) from None
-    return VolcengineTTSService(api_key=api_key, resource_id=resource_id, params=params)
+    return VolcengineTTSService(
+        api_key=api_key, resource_id=VOLCENGINE_TTS_RESOURCE_ID, params=params
+    )
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):

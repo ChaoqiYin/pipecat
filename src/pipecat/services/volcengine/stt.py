@@ -81,7 +81,10 @@ class _RecognitionRequest(BaseModel):
     model_name: str = "bigmodel"
     result_type: str = "single"
     show_utterances: bool = True
-    enable_nonstream: bool = False
+    # The provider closes a segment, and marks it definite, only when its own VAD
+    # detects the end of an utterance. That VAD runs in second-pass mode, so a
+    # long-lived connection reports nothing but interim results without it.
+    enable_nonstream: bool = True
     enable_itn: bool | None = None
     enable_punc: bool | None = None
     corpus: _RequestCorpus | None = None
@@ -173,7 +176,7 @@ class VolcengineSTTService(WebsocketSTTService):
 
     Credentials belong in backend configuration. Definite recognition segments
     are independent of user turn completion, which remains the VAD's concern.
-    Segment timestamps identify committed results within each connection.
+    Segment end timestamps identify committed results within each connection.
     Audio queued during an overflow or connection failure is discarded.
     """
 
@@ -233,7 +236,7 @@ class VolcengineSTTService(WebsocketSTTService):
         self._accepting_audio = False
         self._request_id = ""
         self._sequence = 1
-        self._committed_segments: set[tuple[str, int, int]] = set()
+        self._committed_segments: set[tuple[str, int]] = set()
         self._receive_task: asyncio.Task | None = None
         self._send_task: asyncio.Task | None = None
         self._audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
@@ -433,11 +436,10 @@ class VolcengineSTTService(WebsocketSTTService):
                         if not text:
                             continue
                         if utterance.definite:
-                            start = utterance.start_time
                             end = utterance.end_time
-                            if start is None or end is None:
-                                raise ValueError("Definite segment is missing integer timestamps")
-                            segment = (self._request_id, start, end)
+                            if end is None:
+                                raise ValueError("Definite segment is missing an end timestamp")
+                            segment = (self._request_id, end)
                             if segment in self._committed_segments:
                                 continue
                             self._committed_segments.add(segment)

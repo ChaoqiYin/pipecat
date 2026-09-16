@@ -38,16 +38,23 @@ ELEVENLABS_VOICE_ID=your_api_accessible_voice_id
 音色必须允许当前账户通过 API 使用。HTTP 会话支持系统代理环境变量。
 改用火山引擎识别或合成后，该供应商不再需要 ElevenLabs 凭据。
 
-默认使用 ElevenLabs 识别。要改用火山引擎，在根目录 `.env` 中配置其 API 密钥和账户已开通的资源 ID：
+默认使用 ElevenLabs 识别和合成。要改用火山引擎，在根目录 `.env` 中配置共享的 API 密钥和合成音色：
 
 ```dotenv
 VOLCENGINE_API_KEY=your_volcengine_api_key
-VOLCENGINE_RESOURCE_ID=your_volcengine_resource_id
-VOLCENGINE_STT_OPTIONS='{"enable_itn":true,"enable_punc":true}'
+VOLCENGINE_TTS_SPEAKER=your_voice_id
 ```
 
-未配置任何 `VOLCENGINE_*` 识别设置时，应用继续使用 ElevenLabs 识别。出现任一火山引擎设置后，API 密钥和资源 ID 都必须提供；资源 ID 不提供代码默认值，必须是账户已开通的识别资源。`VOLCENGINE_STT_OPTIONS`
-为可选 JSON 对象，支持 `enable_itn`（逆文本规范化）、`enable_punc`（标点）和
+识别和合成使用同一个 API 密钥。出现 `VOLCENGINE_API_KEY`（或 `VOLCENGINE_STT_OPTIONS`）时改用火山引擎识别；
+出现 `VOLCENGINE_TTS_SPEAKER`（或 `VOLCENGINE_TTS_OPTIONS`）时改用火山引擎合成。只配置识别侧时，
+合成继续使用 ElevenLabs，此时仍需 `ELEVENLABS_API_KEY` 和 `ELEVENLABS_VOICE_ID`。
+
+模型版本由代码固定，不是配置项：识别用 `volc.seedasr.sauc.duration`（豆包流式语音识别模型 2.0
+小时版），合成用 `seed-tts-2.0`（豆包语音合成大模型 2.0），两者都作为 `X-Api-Resource-Id`
+请求头发送，必须是账户已开通的对应资源。
+
+识别侧还可选配 `VOLCENGINE_STT_OPTIONS`
+JSON 对象，支持 `enable_itn`（逆文本规范化）、`enable_punc`（标点）和
 `corpus_context`（供应商定义的语料上下文对象）。省略标点或规范化开关时使用供应商默认行为。
 `corpus_context` 序列化为 `request.corpus.context` 的 JSON 字符串，例如热词提示：
 
@@ -55,34 +62,23 @@ VOLCENGINE_STT_OPTIONS='{"enable_itn":true,"enable_punc":true}'
 VOLCENGINE_STT_OPTIONS='{"corpus_context":{"hotwords":[{"word":"Pipecat"}]}}'
 ```
 
-语料上下文内部格式和热词支持以所选资源的[火山引擎接口文档](https://www.volcengine.com/docs/6561/1354869)
+语料上下文内部格式和热词支持以[火山引擎接口文档](https://www.volcengine.com/docs/6561/1354869)
 为准；应用校验 JSON 对象并传递上下文，不解释内部供应商字段。
-第二遍识别固定关闭，`enable_nonstream` 等未支持的选项会被拒绝。
+第二遍识别固定开启：火山只在二遍模式下按静音分句并给出最终结果，关闭它就只能拿到中间结果，
+用户的话永远不会被判定说完。`enable_nonstream` 等不作为配置项的选项会被拒绝。
 
-选项和供应商在新会话装配时读取，不支持通话中切换。凭据、资源 ID 和识别选项只在后端使用，
-浏览器沿用现有音频、字幕和指标通道。火山引擎配置不完整或选项不合法时，会话创建会返回明确错误，
-错误不包含配置值。
-
-默认使用 ElevenLabs HTTP 合成。要改用火山引擎合成，在根目录 `.env` 中配置其 API 密钥、账户已开通的资源 ID 和音色 ID：
-
-```dotenv
-VOLCENGINE_TTS_API_KEY=your_volcengine_api_key
-VOLCENGINE_TTS_RESOURCE_ID=seed-tts-2.0
-VOLCENGINE_TTS_SPEAKER=your_voice_id
-VOLCENGINE_TTS_OPTIONS='{"audio_format":"pcm","sample_rate":24000}'
-```
-
-未配置任何 `VOLCENGINE_TTS_*` 设置时，应用继续使用 ElevenLabs 合成，并需要 `ELEVENLABS_API_KEY` 和
-`ELEVENLABS_VOICE_ID`。出现任一火山引擎合成设置后，API 密钥、资源 ID 和音色都必须提供；
-资源 ID 不提供代码默认值，必须是账户已开通的合成资源。音色单独通过 `VOLCENGINE_TTS_SPEAKER`
-配置，不能出现在 `VOLCENGINE_TTS_OPTIONS` 中。
+合成音色必须通过 `VOLCENGINE_TTS_SPEAKER` 配置，不能出现在 `VOLCENGINE_TTS_OPTIONS` 中。
 `VOLCENGINE_TTS_OPTIONS` 为可选 JSON 对象，支持 `audio_format`（音频容器，默认 `pcm`）、
 `sample_rate`（输出采样率，省略时跟随流水线采样率）和 `additions`（供应商扩展，JSON 字符串）。
 不支持的键会被拒绝。
 
-语音合成与语音识别的供应商选择互不影响：`VOLCENGINE_TTS_*` 不改变识别供应商，
-`VOLCENGINE_API_KEY` / `VOLCENGINE_RESOURCE_ID` 也不改变合成供应商。两家可以任意组合，
-包括全部使用火山引擎时不提供任何 ElevenLabs 凭据。
+选项和供应商在新会话装配时读取，不支持通话中切换。凭据、音色和识别选项只在后端使用，
+浏览器沿用现有音频、字幕和指标通道。火山引擎配置不完整或选项不合法时，会话创建会返回明确错误，
+错误不包含配置值。
+
+`VOLCENGINE_RESOURCE_ID`、`VOLCENGINE_TTS_API_KEY` 和 `VOLCENGINE_TTS_RESOURCE_ID` 已不再使用，
+配置其中之一会让会话创建失败并说明替代方式，避免留下一个看似生效的实际无用的设置。
+音色不要填进 `VOLCENGINE_RESOURCE_ID`，那是已移除的识别模型版本设置。
 
 示例配置见根目录 `env.example` 和 `local-voice-app/bot/.env.example`。
 `local-voice-app/bot/bot.py` 是共享入口的兼容转发，也读取根目录 `.env`。
@@ -113,7 +109,7 @@ uv run --no-sync pytest tests/test_local_voice_eval.py tests/test_local_voice_ap
 将外部识别、语言模型、语音合成接口替换为本地测试端点。验证中间字幕、确定分句、
 静音后恢复、机器人说话时打断、相同短句再次提交以及客户端取消后的连接清理。
 火山引擎端点会重发同一确定分句，确认它只提交一次；新一轮相同文字仍正常提交。
-第二遍识别关闭通过发往火山引擎端点的真实请求检查，服务测试另行覆盖正常结束时的尾包。
+第二遍识别开启通过发往火山引擎端点的真实请求检查，服务测试另行覆盖正常结束时的尾包。
 
 配置可用时，在仓库根目录运行真实基线：
 
@@ -122,8 +118,9 @@ uv run --no-sync python local-voice-app/eval_stt.py
 ```
 
 脚本顺序启动两个供应商的完整应用，使用独立端口 `17860`，每次结束后回收进程。
-它读取根目录 `.env`，显式进程环境变量优先，不修改配置文件。ElevenLabs 评测子进程会移除火山引擎识别配置；火山引擎评测子进程保留该配置。
-完整应用仍需要 DeepSeek、ElevenLabs 合成凭据及可访问的音色；火山引擎还需要自己的识别凭据。
+它读取根目录 `.env`，显式进程环境变量优先，不修改配置文件。ElevenLabs 评测子进程会移除全部火山引擎配置，
+因为共享的 API 密钥同时决定两侧供应商；火山引擎评测子进程保留该配置，并去掉已移除的设置。
+两家都需要 DeepSeek 凭据；ElevenLabs 分支需要可用的 ElevenLabs 凭据及音色，火山引擎分支需要自己的 API 密钥和音色。
 缺少配置的供应商写为 `skipped`，不计作通过，也不填写准确率或延迟。
 已有配置但鉴权失败、等待不到机器人发声、缺少字幕或打断事件等情况写为 `failed`，命令返回非零。
 
