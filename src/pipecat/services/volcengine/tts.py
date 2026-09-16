@@ -148,7 +148,11 @@ class VolcengineTTSService(WebsocketTTSService):
         )
         if not math.isfinite(flush_timeout) or flush_timeout <= 0:
             raise ValueError("flush_timeout must be finite and positive")
-        self._params = (params or self.InputParams(speaker=speaker)).model_copy(deep=True)
+        self._params = (
+            params.model_copy(deep=True)
+            if params is not None
+            else self.InputParams(speaker=speaker or "")
+        )
         if not self._params.speaker:
             raise ValueError("speaker must be set")
         self._params.sample_rate = self._params.sample_rate or sample_rate
@@ -207,7 +211,11 @@ class VolcengineTTSService(WebsocketTTSService):
             return
         request = _encode_event(
             _TASK_REQUEST,
-            {"user": {"uid": self._connect_id}, "event": _TASK_REQUEST, "req_params": {"text": text}},
+            {
+                "user": {"uid": self._connect_id},
+                "event": _TASK_REQUEST,
+                "req_params": {"text": text},
+            },
             session_id=self._session_id,
         )
         try:
@@ -230,6 +238,7 @@ class VolcengineTTSService(WebsocketTTSService):
         Returns:
             ``None`` on success, or an ``ErrorFrame`` describing a failure.
         """
+        assert self._websocket is not None
         if self._session_id and self._session_context_id == context_id:
             return None
         if self._session_id:
@@ -279,7 +288,9 @@ class VolcengineTTSService(WebsocketTTSService):
         )
         assert self._websocket is not None
         try:
-            await self._websocket.send(_encode_event(_START_CONNECTION, {"namespace": "BidirectionalTTS"}))
+            await self._websocket.send(
+                _encode_event(_START_CONNECTION, {"namespace": "BidirectionalTTS"})
+            )
         except BaseException:
             await self._disconnect_websocket()
             raise
@@ -293,9 +304,7 @@ class VolcengineTTSService(WebsocketTTSService):
             self._websocket = None
             await self._call_event_handler("on_disconnected")
 
-    async def _send_event(
-        self, event: int, payload: dict, *, session_id: str = ""
-    ) -> bool:
+    async def _send_event(self, event: int, payload: dict, *, session_id: str = "") -> bool:
         """Send a client event on the open connection without raising.
 
         Args:
@@ -596,6 +605,7 @@ class VolcengineTTSService(WebsocketTTSService):
     def _chunk_frames(self, audio: bytes, final: bool) -> list[Frame]:
         frames: list[Frame] = []
         if audio:
+            assert self._params.sample_rate is not None  # resolved in setup()
             frames.append(
                 TTSAudioRawFrame(
                     audio=audio,

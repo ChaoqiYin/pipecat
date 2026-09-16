@@ -62,10 +62,7 @@ def _audio_only_server(audio: bytes, *, final: bool = False) -> bytes:
     flags = 0x2 if final else 0x0
     sequence = struct.pack(">i", -1) if final else b""
     return (
-        bytes((0x11, 0xB0 | flags, 0x00, 0x00))
-        + sequence
-        + struct.pack(">I", len(audio))
-        + audio
+        bytes((0x11, 0xB0 | flags, 0x00, 0x00)) + sequence + struct.pack(">I", len(audio)) + audio
     )
 
 
