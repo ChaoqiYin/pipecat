@@ -10,6 +10,12 @@
   min-height: 0;
 }
 
+/* 对话区要能在 flex 列里收缩，库编译出的 CSS 没有 min-h-0 这个类。 */
+.chat-conversation {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
 .user-audio-panel {
   flex-shrink: 0;
 }

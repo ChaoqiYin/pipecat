@@ -12,6 +12,7 @@ import {
 } from '@pipecat-ai/voice-ui-kit';
 
 import { App } from './components/App';
+import { STRINGS } from './strings';
 import {
   AVAILABLE_TRANSPORTS,
   DEFAULT_TRANSPORT,
@@ -41,7 +42,7 @@ export const Main = () => {
             !client ? (
               <SpinLoader />
             ) : error ? (
-              <ErrorCard>{error}</ErrorCard>
+              <ErrorCard title={STRINGS.errorCard.title}>{error}</ErrorCard>
             ) : (
               <App
                 client={client}

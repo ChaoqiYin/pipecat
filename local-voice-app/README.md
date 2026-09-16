@@ -1,24 +1,37 @@
 # 本地语音应用
 
-使用 Pipecat 自带的 Playground 网页，通过 WebRTC 与机器人对话：
+使用本目录的 React 客户端（`client/`），通过 WebRTC 与机器人对话：
 
 - 语音识别：ElevenLabs Realtime STT（默认）或火山引擎双向流式识别
 - 语言模型：DeepSeek
 - 语音合成：ElevenLabs HTTP TTS（默认，模型为 `eleven_multilingual_v2`）或火山引擎双向流式合成
 
-本目录保存应用启动入口。网页由 `pipecat-ai-prebuilt` 依赖提供，无需单独启动前端构建服务。运行时需保留本目录所在的 Pipecat 仓库；它不是一个可单独搬走的前端构建产物。
+本目录保存应用的前端和后端：`bot.py` 是后端入口，`client/` 是独立的 Vite 网页客户端。
+运行时需保留本目录所在的 Pipecat 仓库；它不是一个可单独搬走的前端构建产物。
 
 ## 启动
 
-在项目根目录执行：
+前后端是两个进程，都在项目根目录执行。后端：
 
 ```bash
 bash local-voice-app/start.sh
 ```
 
-打开 <http://localhost:7860/client/>，连接并允许麦克风访问。终端按 `Ctrl+C` 停止服务。
+客户端：
+
+```bash
+npm --prefix local-voice-app/client run dev
+```
+
+打开 <http://localhost:5174/>，连接并允许麦克风访问。两个进程各按 `Ctrl+C` 停止。
+
+说到“启动应用”时，默认指后端加 `client/` 这个 React 客户端。Pipecat 自带的 Playground 仍由 runner 挂在
+<http://localhost:7860/client/>，只在需要对照框架默认界面时使用，不是本应用的入口。
+客户端连接的后端地址由 `VITE_BOT_START_URL` 决定，默认 `http://localhost:7860/start`，见 `client/env.example`；
+后端换端口时浏览器仍会连旧地址。
 
 脚本从文件位置定位项目根目录，读取根目录 `.env`，不会依赖临时目录。启动使用现有虚拟环境，不会自动同步或移除依赖。
+客户端依赖装在 `client/node_modules`，不在版本控制中。
 
 ## 配置
 
@@ -91,6 +104,7 @@ VOLCENGINE_STT_OPTIONS='{"corpus_context":{"hotwords":[{"word":"Pipecat"}]}}'
 ```bash
 uv sync --extra runner --extra webrtc
 uv run --no-sync python -m nltk.downloader punkt_tab
+npm --prefix local-voice-app/client install
 ```
 
 若使用离线下载的 `punkt_tab.zip`，将其解压到 `~/nltk_data/tokenizers/`，确保存在 `~/nltk_data/tokenizers/punkt_tab/english/`。
