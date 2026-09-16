@@ -297,6 +297,7 @@ async def test_incomplete_volcengine_synthesis_configuration_fails_clearly(confi
         '{"sample_rate":"secret-invalid-value"}',
         '{"audio_format":["secret-invalid-value"]}',
         '{"unknown":"secret-invalid-value"}',
+        '{"speaker":"secret-invalid-speaker"}',
         "[1, 2]",
     ],
 )

@@ -126,11 +126,12 @@ def create_tts_service(
     speaker = _required_setting(config, "VOLCENGINE_TTS_SPEAKER")
     options = config.get("VOLCENGINE_TTS_OPTIONS", "{}")
     try:
-        # The voice is configured on its own, so it is supplied here and excluded
-        # from the options object.
-        params = VolcengineTTSService.InputParams.model_validate_json(
-            json.dumps({"speaker": speaker, **json.loads(options)})
-        )
+        parsed = json.loads(options)
+        # The voice has its own setting, so an options-supplied one is rejected
+        # rather than silently overriding it.
+        if not isinstance(parsed, dict) or "speaker" in parsed:
+            raise TypeError
+        params = VolcengineTTSService.InputParams.model_validate({"speaker": speaker, **parsed})
     except (ValidationError, json.JSONDecodeError, TypeError):
         raise ValueError(
             "VOLCENGINE_TTS_OPTIONS must be a JSON object with supported synthesis options "
