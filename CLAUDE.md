@@ -12,4 +12,4 @@ Use the default labels `needs-triage`, `needs-info`, `ready-for-agent`, `ready-f
 
 ### Domain docs
 
-Use the single-context layout with root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
+This repo uses the multi-context layout: `CONTEXT-MAP.md` at the root points at one `CONTEXT.md` per context, each with its own `docs/adr/`. See `docs/agents/domain.md`.

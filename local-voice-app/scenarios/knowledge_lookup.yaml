@@ -1,0 +1,76 @@
+name: knowledge_lookup
+
+# Text, end to end: the session's knowledge base is an HTTP API, and the fake
+# one in tests/assets/fake_wiki_api.py stands in for the llm_wiki desktop
+# application, so nothing here depends on one being installed. Tests that the
+# model looks a question up before answering it, and that what it says comes
+# from what the lookup returned.
+#
+# Both directions are asserted, because they fail differently. A lookup the bot
+# should have made leaves only a reply that sounds informed — the model answers
+# a knowledge question from its own recall just as fluently, and nothing in the
+# reply says which it did — so the call is the only thing that tells a lookup
+# apart from a guess. A lookup it should not have made costs a turn its latency
+# for nothing, which is the payoff of leaving the decision to the model, so the
+# small-talk turn carries an `absent:` check.
+#
+# Start the fake knowledge base, then the bot, then run this scenario:
+#
+#   FAKE_WIKI_PORT=7891 uv run --no-sync python tests/assets/fake_wiki_api.py
+#
+#   WIKI_API_BASE_URL=http://127.0.0.1:7891 \
+#     uv run --no-sync python local-voice-app/bot.py -t eval --port 7890
+#
+#   uv run --no-sync python -m pipecat.evals run \
+#     local-voice-app/scenarios/knowledge_lookup.yaml --bot-url ws://localhost:7890 -v
+#
+# Only the base URL goes on the bot's command line: the runner loads the
+# repository .env over the environment, so the WIKI_TOKEN the root .env carries
+# is the one the session gets, and it is the token that registers the tool at
+# all. Any token does here — the fake API accepts any unless started with
+# `FAKE_WIKI_TOKEN`. The fake API's other environment variables, which choose
+# the pages it serves and where it logs what the bot sent it, are listed in its
+# docstring; this scenario's question, and the fact its answer turn pins, are
+# both taken from the pages it serves by default.
+#
+# The bot needs the credentials it always needs (root .env): DEEPSEEK_API_KEY
+# and the Volcengine pair. This scenario is text on both sides and judges
+# nothing, so it needs no audio models and no Ollama judge — the run's `judge:`
+# line is the default block, and no expectation of this file asks it anything.
+# It does reach the model provider for real, and each run costs a few LLM calls.
+
+turns:
+  # Wait for the bot's on-connect greeting before speaking (avoids barging into it).
+  - expect:
+      - event: response
+
+  # Small talk. The reply is awaited first, both to pace the turn and to leave
+  # the model's decision behind us; the quiet window then covers the whole of it,
+  # so a call made for this turn is already queued and fails the check at once.
+  - user: "Hi there, how's it going?"
+    expect:
+      - event: response
+      - event: function_call
+        absent: true
+        within_ms: 8000
+
+  # A question the fake knowledge base covers, so the tool should be called
+  # before the bot answers. The budget is what a bot that never looks anything
+  # up spends waiting, so it is kept near the call's own latency rather than at
+  # the 60s default.
+  - user: "What level is the axle counter section unknown alarm?"
+    expect:
+      - event: function_call
+        calls:
+          - name: search_knowledge_base
+        within_ms: 20000
+
+  # The answer is awaited on a turn of its own, and pinned to a fact that only
+  # the fake knowledge base's page text carries: a bot that looked the question
+  # up and then answered from its own recall has nothing to say about it. Sharing
+  # this turn with the one above does not hold: the lookup round emits a response
+  # of its own, which satisfies the expectation there, so the scenario would pass
+  # on a bot that never answered.
+  - expect:
+      - event: response
+        text_contains: "level 4"

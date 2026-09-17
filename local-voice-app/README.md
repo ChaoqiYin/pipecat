@@ -48,7 +48,7 @@ ELEVENLABS_API_KEY=your_elevenlabs_api_key
 ELEVENLABS_VOICE_ID=your_api_accessible_voice_id
 ```
 
-音色必须允许当前账户通过 API 使用。HTTP 会话支持系统代理环境变量。
+音色必须允许当前账户通过 API 使用。语音供应商的 HTTP 会话支持系统代理环境变量。
 改用火山引擎识别或合成后，该供应商不再需要 ElevenLabs 凭据。
 
 默认使用 ElevenLabs 识别和合成。要改用火山引擎，在根目录 `.env` 中配置共享的 API 密钥和合成音色：
@@ -97,6 +97,43 @@ VOLCENGINE_STT_OPTIONS='{"corpus_context":{"hotwords":[{"word":"Pipecat"}]}}'
 `local-voice-app/bot/bot.py` 是共享入口的兼容转发，也读取根目录 `.env`。
 
 
+## 知识库
+
+应用经 HTTP 接入外部知识库：把知识库查询注册成模型可自主调用的一个工具，由模型判断该不该查。
+整项功能由根目录 `.env` 中的一个变量启用：
+
+```dotenv
+WIKI_TOKEN=your_wiki_api_token
+```
+
+不配置这个变量，或者把它留空，会话就不接知识库：不注册工具，指令也不提知识库，行为与没有这项功能时完全一致。
+
+知识库是 `llm_wiki` 桌面应用，它在本机回环上暴露一个 token 保护的 HTTP API，`WIKI_TOKEN` 是该 API 的令牌。
+API 根地址由可选变量 `WIKI_API_BASE_URL` 给出，默认 `http://127.0.0.1:19828`，必须是绝对的 http 或 https 地址。
+应用只请求它的两个路由：`POST /api/v1/projects/current/search`（带 `includeContent: true`，
+一次取回排名靠前的若干页及其正文）和 `GET /api/v1/projects/current/files/content`
+（搜索没带回正文时按 path 补读一页）。
+
+对模型只暴露一个工具，它内部完成「搜索 → 读最相关的一两页 → 返回正文」，这是一次调用。
+搜索只用来定位页面，回答取自整页正文——片段会在行中间截断，答案所在的那一行往往不在其中。
+读几页、每页留多长、一次检索的上限，都是应用内的常量而不是配置项。
+
+知识库没启动、令牌不被接受、检索超时或没查到内容，对用户一律表现为“查不到”：模型被要求照实说没找到，
+不报告故障，也不拿自己已知的内容顶上，会话继续。日志把“没查到”和“没连上”分开记。
+会话建立时不连知识库，它当时是否可用要到第一次检索才知道。`WIKI_API_BASE_URL` 不是绝对地址则让会话创建失败，
+错误说明原因且不回显配置值。
+
+本机使用时，bot、浏览器客户端和知识库桌面应用**三者必须同机**：HTTP API 只监听回环。远程部署要另找出路。
+
+知识库访问不走代理：它的 HTTP 会话显式 `trust_env=False`，本机环境里存在代理时，回环请求也不会被交给代理。
+语音供应商的会话不受此影响。
+
+检索进行期间先播一句“我查一下。”。它是应用内的常量，不是配置项；不进入对话历史，
+但会作为机器人转写显示在客户端。模型只在知识库可用时才去查，寒暄、感谢、闲聊不触发检索。
+
+`local-voice-app/scenarios/knowledge_lookup.yaml` 覆盖这条路径，文件头注释里有完整运行命令与前置条件。
+
+
 ## 新环境准备
 
 当前机器已经安装依赖和 NLTK 数据，无需重复操作。在新的仓库检出中执行：
@@ -106,6 +143,8 @@ uv sync --extra runner --extra webrtc
 uv run --no-sync python -m nltk.downloader punkt_tab
 npm --prefix local-voice-app/client install
 ```
+
+知识库功能只用 HTTP 客户端，不需要可选依赖。
 
 若使用离线下载的 `punkt_tab.zip`，将其解压到 `~/nltk_data/tokenizers/`，确保存在 `~/nltk_data/tokenizers/punkt_tab/english/`。
 
